@@ -114,7 +114,7 @@ class GenerationView(discord.ui.View):
     A view that holds the state of a generation and contains the action buttons.
     """
     def __init__(self, original_ctx, prompt, seed, preset_name, is_upscaled: bool):
-        super().__init__(timeout=300) # 5-minute timeout for the buttons
+        super().__init__(timeout=3600) # 1-hour timeout for the buttons
         self.original_ctx = original_ctx
         self.prompt = prompt
         self.seed = seed
