@@ -89,7 +89,3 @@ class ForgeAPIClient:
             print("No 'images' found in the Forge API response.")
             return None, None
         return None, None
-
-# You could add other API interactions here if needed, e.g., for getting models:
-# def get_models(self):
-#     return self._send_request("GET", f"{self.base_url}/sdapi/v1/sd-models")

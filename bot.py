@@ -143,10 +143,11 @@ class GenerationView(discord.ui.View):
         self.seed = seed
         self.preset_name = preset_name
 
-        # The "Upscale" button should not be shown if the image is already an upscale.
+        # The "Upscale" and "Rerun" buttons should not be shown if the image is already an upscale.
         if is_upscaled:
             self.upscale_button.disabled = True
             self.upscale_button.style = discord.ButtonStyle.secondary
+            self.rerun_button.disabled = True
 
     async def on_timeout(self):
         # When the view times out, disable all components
@@ -173,6 +174,20 @@ class GenerationView(discord.ui.View):
             preset_name=self.preset_name,
             upscale=True,
             seed=self.seed
+        )
+
+    @discord.ui.button(label="Rerun", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def rerun_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Callback for the rerun button."""
+        await interaction.response.send_message(f"Rerunning prompt for {interaction.user.mention} with a new seed...", ephemeral=True)
+
+        # Call the generation function with the same prompt but a random seed
+        await _generate_image(
+            ctx=self.original_ctx,
+            prompt=self.prompt,
+            preset_name=self.preset_name,
+            upscale=False, # A rerun is not an upscale
+            seed=-1 # Use a random seed
         )
 
     @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
@@ -229,7 +244,7 @@ async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, see
         payload["alwayson_scripts"]["img2img hires fix"] = {"args": [{
             "hr_upscaler": HIRES_UPSCALER, "hr_second_pass_steps": HIRES_STEPS,
             "denoising_strength": HIRES_DENOISING, "hr_scale": HIRES_UPSCALE_BY,
-            "hr_sampler": "DPM++ 2M", "hr_resize_x": HIRES_RESIZE_WIDTH,
+            "hr_sampler": "Euler a", "hr_resize_x": HIRES_RESIZE_WIDTH,
             "hr_resize_y": HIRES_RESIZE_HEIGHT,
         }]}
 
