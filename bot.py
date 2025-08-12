@@ -65,22 +65,15 @@ def parse_generate_args(prompt_string: str):
     # shlex helps split the string while respecting quoted sections
     words = shlex.split(prompt_string)
 
-    # Manually separate args from the prompt because argparse can be greedy
-    args_list = []
-    prompt_words = []
-    for word in words:
-        # argparse handles --seed=12345 automatically, so we treat it as one arg
-        if word.startswith('--'):
-            args_list.append(word)
-        else:
-            prompt_words.append(word)
-
     try:
-        # Parse only the arguments we extracted
-        namespace, _ = parser.parse_known_args(args_list)
+        # Let argparse handle separating known args from the rest of the prompt
+        namespace, prompt_words = parser.parse_known_args(words)
         parsed_args = vars(namespace)
     except (ValueError, argparse.ArgumentError) as e:
-        raise ValueError(f"Invalid argument. Please check your syntax. Details: {e}")
+        # If parsing fails, assume the whole string was a prompt with no valid args
+        logging.warning(f"Could not parse args, treating as full prompt. Details: {e}")
+        parsed_args = {}
+        prompt_words = words
 
     cleaned_prompt = ' '.join(prompt_words)
     return parsed_args, cleaned_prompt
