@@ -18,8 +18,10 @@ ALLOWED_CHANNEL_IDS = [
     1390064079720153219
 ]
 
-# --- Moderator Settings ---
-# A list of role IDs that are allowed to delete bot messages.
+# --- Permission Settings ---
+# The role required to generate images.
+GENERATION_ROLE_ID = 1404675951668760709
+# A list of role IDs that can delete any bot message.
 MODERATOR_ROLE_IDS = [
     1202820140958490725,
     1201664265606680639,

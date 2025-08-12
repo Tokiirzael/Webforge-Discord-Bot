@@ -13,7 +13,7 @@ import argparse
 
 # Import settings from the config file
 from config import (
-    DISCORD_TOKEN_NAME, COMMAND_PREFIX, ALLOWED_CHANNEL_IDS, MODERATOR_ROLE_IDS,
+    DISCORD_TOKEN_NAME, COMMAND_PREFIX, ALLOWED_CHANNEL_IDS, MODERATOR_ROLE_IDS, GENERATION_ROLE_ID,
     DEFAULT_STEPS, DEFAULT_CFG_SCALE, DEFAULT_SAMPLER_NAME, DEFAULT_SEED, DEFAULT_MODEL,
     DEFAULT_CLIP_SKIP, RESOLUTIONS, FORBIDDEN_NEGATIVE_TERMS,
     BASE_POSITIVE_PROMPT, BASE_NEGATIVE_PROMPT,
@@ -92,14 +92,26 @@ def clean_negative_prompt(user_negative_prompt: str) -> str:
         cleaned_prompt = cleaned_prompt.replace(term, "", -1).replace(term.capitalize(), "", -1)
     return " ".join(cleaned_prompt.split()).strip()
 
-def is_allowed_channel():
-    """A custom check to ensure bot commands only run in specified channels."""
+def check_permissions():
+    """
+    A custom check to ensure the user has the required roles and is in an allowed channel.
+    """
     async def predicate(ctx):
-        if not ALLOWED_CHANNEL_IDS or ctx.channel.id in ALLOWED_CHANNEL_IDS:
-            return True
-        else:
-            await ctx.send(f"Sorry, {ctx.author.mention}, you can only use me in designated channels.")
+        # Check 1: Channel check
+        if ALLOWED_CHANNEL_IDS and ctx.channel.id not in ALLOWED_CHANNEL_IDS:
+            await ctx.send(f"Sorry, {ctx.author.mention}, you can only use me in designated channels.", ephemeral=True)
             return False
+
+        # Check 2: Role check
+        user_roles = [role.id for role in ctx.author.roles]
+        has_gen_role = GENERATION_ROLE_ID in user_roles
+        has_mod_role = any(role_id in user_roles for role_id in MODERATOR_ROLE_IDS)
+
+        if not has_gen_role and not has_mod_role:
+            await ctx.send(f"Sorry, {ctx.author.mention}, you don't have the required role to generate images.", ephemeral=True)
+            return False
+
+        return True
     return commands.check(predicate)
 
 # --- UI Components ---
@@ -280,7 +292,7 @@ async def on_command_error(ctx, error):
 
 @bot.command(name="generate", aliases=["generateport", "generateland"],
              help="Generates an image. Aliases: generateport, generateland.")
-@is_allowed_channel()
+@check_permissions()
 async def generate(ctx, *, full_prompt_string: str):
     """Generates an image with a specified orientation and optional arguments.
 
