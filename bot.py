@@ -14,6 +14,7 @@ import argparse
 # Import settings from the config file
 from config import (
     DISCORD_TOKEN_NAME, COMMAND_PREFIX, ALLOWED_CHANNEL_IDS, MODERATOR_ROLE_IDS, GENERATION_ROLE_ID,
+    STATS_FILE, GENERATION_TIERS,
     DEFAULT_STEPS, DEFAULT_CFG_SCALE, DEFAULT_SAMPLER_NAME, DEFAULT_SEED, DEFAULT_MODEL,
     DEFAULT_CLIP_SKIP, RESOLUTIONS, FORBIDDEN_NEGATIVE_TERMS,
     BASE_POSITIVE_PROMPT, BASE_NEGATIVE_PROMPT,
@@ -45,8 +46,21 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
 forge_api = ForgeAPIClient()
+user_stats = {} # In-memory cache for user generation stats
 
 # --- Helper Functions ---
+
+def load_stats():
+    """Loads user stats from the JSON file."""
+    if os.path.exists(STATS_FILE):
+        with open(STATS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_stats(stats_dict):
+    """Saves the given stats dictionary to the JSON file."""
+    with open(STATS_FILE, 'w') as f:
+        json.dump(stats_dict, f, indent=4)
 
 def parse_generate_args(prompt_string: str):
     """
@@ -84,6 +98,15 @@ def clean_negative_prompt(user_negative_prompt: str) -> str:
     for term in FORBIDDEN_NEGATIVE_TERMS:
         cleaned_prompt = cleaned_prompt.replace(term, "", -1).replace(term.capitalize(), "", -1)
     return " ".join(cleaned_prompt.split()).strip()
+
+def get_user_title(count: int) -> str:
+    """Returns a user's title based on their generation count."""
+    # The GENERATION_TIERS list is sorted from highest to lowest.
+    # We iterate through it and return the first title the user qualifies for.
+    for threshold, title in GENERATION_TIERS:
+        if count >= threshold:
+            return title
+    return "" # Return an empty string if no tier is met
 
 def check_permissions():
     """
@@ -226,18 +249,35 @@ async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, see
     image, info_json = await asyncio.to_thread(forge_api.txt2img, payload)
 
     if image and info_json:
+        # --- Stat Tracking ---
+        user_id_str = str(ctx.author.id)
+        user_stats[user_id_str] = user_stats.get(user_id_str, 0) + 1
+        save_stats(user_stats)
+
+        generation_count = user_stats[user_id_str]
+        user_title = get_user_title(generation_count)
+
+        # --- Message Formatting ---
         try:
             info_data = json.loads(info_json)
             final_seed = info_data.get("seed", "unknown")
         except json.JSONDecodeError:
             final_seed = "unknown"
 
+        # Build the response string
+        response_parts = []
+        if user_title:
+            response_parts.append(f"Title: {user_title}")
+        response_parts.append(f"Generation #{generation_count}")
+        response_parts.append(f"Seed: `{final_seed}`")
+
+        response_text = f"Here's your image, {ctx.author.mention}! ({' | '.join(response_parts)})"
+
         with io.BytesIO() as image_binary:
             image.save(image_binary, 'PNG')
             image_binary.seek(0)
             discord_file = discord.File(fp=image_binary, filename=f"seed_{final_seed}.png")
 
-            # Create the view with the buttons
             view = GenerationView(
                 original_ctx=ctx,
                 prompt=prompt,
@@ -246,16 +286,10 @@ async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, see
                 is_upscaled=upscale
             )
 
-            message = await ctx.send(
-                f"Here's your image, {ctx.author.mention}! (Seed: `{final_seed}`)",
-                file=discord_file,
-                view=view
-            )
+            message = await ctx.send(response_text, file=discord_file, view=view)
+            view.message = message # Store message for view timeout
 
-            # Store the message object in the view so we can edit it later (e.g., on timeout)
-            view.message = message
-
-            logging.info(f"Image sent for '{ctx.author}'. Seed: {final_seed}")
+            logging.info(f"Image sent for '{ctx.author}'. Seed: {final_seed}, Total Gens: {generation_count}")
     else:
         await ctx.send(MSG_GEN_ERROR)
         logging.error("Failed to get image from Forge API.")
@@ -265,7 +299,10 @@ async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, see
 @bot.event
 async def on_ready():
     """Called when the bot successfully connects to Discord."""
+    global user_stats
+    user_stats = load_stats()
     print(f'Bot connected as {bot.user}!')
+    print(f'Loaded stats for {len(user_stats)} users.')
     print(f'Using Forge API at: {forge_api.base_url}')
     await bot.change_presence(activity=discord.Game(name=f"Art with {COMMAND_PREFIX}generate"))
 

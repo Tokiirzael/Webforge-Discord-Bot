@@ -28,6 +28,18 @@ MODERATOR_ROLE_IDS = [
     1202859329863159838
 ]
 
+# --- Stat Tracking and Tiers ---
+STATS_FILE = "user_stats.json"
+# The titles users get as they generate more images.
+# The number is the minimum generations needed to achieve the title.
+# The list must be sorted from highest threshold to lowest.
+GENERATION_TIERS = [
+    (80, "Ghost in the System"),
+    (60, "Digitized"),
+    (40, "Attentive"),
+    (20, "Curiosity"),
+]
+
 # --- Stable Diffusion Forge API Settings ---
 # The address of your running Forge instance.
 FORGE_API_URL = "http://127.0.0.1:7860"
