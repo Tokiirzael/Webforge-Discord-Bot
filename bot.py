@@ -13,6 +13,7 @@ import asyncio # For asynchronous operations
 import io
 import datetime
 from zoneinfo import ZoneInfo
+import base64
 
 # Import our custom modules
 from config import (
@@ -164,6 +165,48 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # Define the full list of channels where any chat can happen
+    all_chat_channels = PAINT_CHANNEL_IDS + CHAT_CHANNEL_IDS
+
+    # Handle Image Attachments for Gemma
+    if message.attachments:
+        attachment = message.attachments[0]
+        if "image" in attachment.content_type:
+
+            is_allowed = (message.channel.id in all_chat_channels or
+                          (message.channel.category and message.channel.category.id in ALLOWED_CATEGORY_IDS))
+            if not is_allowed:
+                return
+
+            try:
+                await message.add_reaction("🤔")
+
+                image_bytes = await attachment.read()
+                base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+                prompt = message.content
+                if not prompt:
+                    prompt = "Describe this image in detail."
+
+                # The new endpoint does not use the text prompt, only the image.
+                response_text = await asyncio.to_thread(
+                    kobold_api.interrogate_image,
+                    base64_image=base64_image
+                )
+
+                await message.remove_reaction("🤔", bot.user)
+
+                if response_text:
+                    await message.channel.send(response_text)
+                else:
+                    await message.channel.send("Sorry, I couldn't interpret that image.")
+
+            except Exception as e:
+                logging.error(f"Error processing image attachment: {e}")
+                await message.channel.send("Sorry, an error occurred while processing the image.")
+
+            return
+
     # 1. Prioritize standard commands to prevent hijacking by mention logic
     if message.content.startswith(COMMAND_PREFIX):
         await bot.process_commands(message)
@@ -273,7 +316,15 @@ async def on_message(message):
         if response_text:
             history.append({"user_name": message.author.display_name, "text": user_message})
             history.append({"user_name": CHARACTER_NAME, "text": response_text})
-            await message.channel.send(response_text)
+
+            # Send the response, splitting into chunks if necessary
+            if len(response_text) <= 2000:
+                await message.channel.send(response_text)
+            else:
+                for i in range(0, len(response_text), 1990):
+                    chunk = response_text[i:i + 1990]
+                    await message.channel.send(chunk)
+                    await asyncio.sleep(1)
         else:
             await message.channel.send("Sorry, I couldn't get a response from the character.")
         return

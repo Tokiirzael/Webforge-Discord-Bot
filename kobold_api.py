@@ -68,3 +68,22 @@ class KoboldAPIClient:
             print("No 'results' found in the KoboldCpp API response.")
             return None
         return None
+
+    def interrogate_image(self, base64_image: str):
+        """
+        Sends an image to the /sdapi/v1/interrogate endpoint to get a text caption.
+        """
+        interrogate_url = f"{self.base_url}/sdapi/v1/interrogate"
+        payload = {
+            "image": base64_image,
+            "model": "clip" # Common default interrogator model
+        }
+
+        print("Sending image interrogation request...")
+        response_data = self._send_request("POST", interrogate_url, data=payload)
+
+        if response_data and "caption" in response_data:
+            return response_data["caption"]
+        else:
+            print("No 'caption' found in the interrogation response.")
+            return None
