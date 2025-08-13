@@ -11,9 +11,14 @@ import json
 import shlex
 import argparse
 
+import datetime
+from zoneinfo import ZoneInfo
+import base64
+
 # Import settings from the config file
 from config import (
-    DISCORD_TOKEN_NAME, COMMAND_PREFIX, ALLOWED_CHANNEL_IDS, MODERATOR_ROLE_IDS, GENERATION_ROLE_ID,
+    DISCORD_TOKEN_NAME, COMMAND_PREFIX, PAINT_CHANNEL_IDS, CHAT_CHANNEL_IDS, ALLOWED_CATEGORY_IDS,
+    MODERATOR_ROLE_IDS, GENERATION_ROLE_ID,
     STATS_FILE, GENERATION_TIERS,
     DEFAULT_STEPS, DEFAULT_CFG_SCALE, DEFAULT_SAMPLER_NAME, DEFAULT_SEED, DEFAULT_MODEL,
     DEFAULT_CLIP_SKIP, RESOLUTIONS, FORBIDDEN_NEGATIVE_TERMS,
@@ -23,9 +28,11 @@ from config import (
     ADETAILER_INPAINT_DENOISING, ADETAILER_INPAINT_ONLY_MASKED, ADETAILER_INPAINT_PADDING,
     HIRES_UPSCALER, HIRES_STEPS, HIRES_DENOISING, HIRES_UPSCALE_BY,
     HIRES_RESIZE_WIDTH, HIRES_RESIZE_HEIGHT,
-    MSG_GENERATING, MSG_GEN_ERROR, MSG_NO_PROMPT, MSG_API_ERROR
+    MSG_GENERATING, MSG_GEN_ERROR, MSG_NO_PROMPT, MSG_API_ERROR,
+    KOBOLDCPP_API_URL, CHARACTER_NAME, CHARACTER_PERSONA, CONTEXT_TOKEN_LIMIT
 )
 from forge_api import ForgeAPIClient
+from kobold_api import KoboldAPIClient
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
@@ -44,9 +51,12 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
 forge_api = ForgeAPIClient()
+kobold_api = KoboldAPIClient(base_url=KOBOLDCPP_API_URL)
 user_stats = {} # In-memory cache for user generation stats
+chat_histories = {} # key: channel_id, value: list of messages
+listening_channels = {} # {channel_id: asyncio.Task}
 
 # --- Helper Functions ---
 
@@ -108,26 +118,41 @@ def get_user_title(count: int) -> str:
             return title
     return "" # Return an empty string if no tier is met
 
-def check_permissions():
-    """
-    A custom check to ensure the user has the required roles and is in an allowed channel.
-    """
+def get_token_count(text: str) -> int:
+    """Approximates the number of tokens in a string (1 token ~ 4 chars)."""
+    return len(text) // 4
+
+async def listening_timer(channel: discord.TextChannel):
+    """Manages the 30-minute timer for listen mode."""
+    try:
+        await asyncio.sleep(29 * 60)
+        warning_message = (
+            f"**Attention:** Listen mode will automatically turn off in 60 seconds. "
+            f"Type `!listen` to reset the timer for another 30 minutes."
+        )
+        await channel.send(warning_message)
+        await asyncio.sleep(60)
+
+        if channel.id in listening_channels:
+            del listening_channels[channel.id]
+            if channel.id in chat_histories:
+                del chat_histories[channel.id]
+            await channel.send("**Listen mode has been deactivated. Chat history for this session has been cleared.**")
+    except asyncio.CancelledError:
+        logging.info(f"Listen mode timer for channel {channel.id} was cancelled (likely reset).")
+    except Exception as e:
+        logging.error(f"An error occurred in the listening timer for channel {channel.id}: {e}")
+        if channel.id in listening_channels:
+            del listening_channels[channel.id]
+
+def is_allowed_paint_channel():
+    """A custom check to ensure bot commands only run in specified paint channels."""
     async def predicate(ctx):
-        # Check 1: Channel check
-        if ALLOWED_CHANNEL_IDS and ctx.channel.id not in ALLOWED_CHANNEL_IDS:
-            await ctx.send(f"Sorry, {ctx.author.mention}, you can only use me in designated channels.", ephemeral=True)
+        if not PAINT_CHANNEL_IDS or ctx.channel.id in PAINT_CHANNEL_IDS:
+            return True
+        else:
+            await ctx.send(f"Sorry, {ctx.author.mention}, you can only use me in paint channels.", ephemeral=True)
             return False
-
-        # Check 2: Role check
-        user_roles = [role.id for role in ctx.author.roles]
-        has_gen_role = GENERATION_ROLE_ID in user_roles
-        has_mod_role = any(role_id in user_roles for role_id in MODERATOR_ROLE_IDS)
-
-        if not has_gen_role and not has_mod_role:
-            await ctx.send(f"Sorry, {ctx.author.mention}, you don't have the required role to generate images.", ephemeral=True)
-            return False
-
-        return True
     return commands.check(predicate)
 
 # --- UI Components ---
@@ -319,14 +344,156 @@ async def on_ready():
     print(f'Bot connected as {bot.user}!')
     print(f'Loaded stats for {len(user_stats)} users.')
     print(f'Using Forge API at: {forge_api.base_url}')
-    await bot.change_presence(activity=discord.Game(name=f"Art with {COMMAND_PREFIX}generate"))
+    print(f'Using KoboldCpp API at: {kobold_api.base_url}')
+    await bot.change_presence(activity=discord.Game(name=f"Art & Chat"))
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    # Define the full list of channels where any chat can happen
+    all_chat_channels = PAINT_CHANNEL_IDS + CHAT_CHANNEL_IDS
+
+    # Handle Image Attachments for Gemma
+    if message.attachments:
+        attachment = message.attachments[0]
+        if "image" in attachment.content_type:
+
+            is_allowed = (message.channel.id in all_chat_channels or
+                          (message.channel.category and message.channel.category.id in ALLOWED_CATEGORY_IDS))
+            if not is_allowed:
+                return
+
+            try:
+                await message.add_reaction("🤔")
+
+                image_bytes = await attachment.read()
+                base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+                # The new endpoint does not use the text prompt, only the image.
+                response_text = await asyncio.to_thread(
+                    kobold_api.interrogate_image,
+                    base64_image=base64_image
+                )
+
+                await message.remove_reaction("🤔", bot.user)
+
+                if response_text:
+                    await message.channel.send(response_text)
+                else:
+                    await message.channel.send("Sorry, I couldn't interpret that image.")
+
+            except Exception as e:
+                logging.error(f"Error processing image attachment: {e}")
+                await message.channel.send("Sorry, an error occurred while processing the image.")
+
+            return # Stop further processing after handling the image
+
+    # 1. Prioritize standard commands to prevent hijacking by mention logic
+    if message.content.startswith(COMMAND_PREFIX):
+        await bot.process_commands(message)
+        return
+
+    command_trigger = "!" + CHARACTER_NAME.lower()
+
+    # 2. Handle !stop command to manually deactivate listen mode
+    if message.content.lower() == '!stop':
+        if message.channel.id in listening_channels:
+            task = listening_channels.pop(message.channel.id)
+            task.cancel()
+            if message.channel.id in chat_histories:
+                del chat_histories[message.channel.id]
+            await message.channel.send("**Listen mode has been manually deactivated. Chat history for this session has been cleared.**")
+        return
+
+    # 3. Handle !listen command to reset the timer
+    if message.content.lower() == '!listen':
+        if message.channel.id in listening_channels:
+            listening_channels[message.channel.id].cancel()
+
+        listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
+        await message.channel.send("Listen mode timer has been reset for another 30 minutes.")
+        return
+
+    # 4. Handle chat logic
+    if message.content.lower() == command_trigger:
+        # If the user just types the trigger word, respond with the greeting
+        await message.channel.send(config.CHARACTER_GREETING)
+        return
+
+    is_direct_chat = message.content.lower().startswith(command_trigger + " ")
+    is_mention_in_listen_mode = (message.channel.id in listening_channels and
+                                 CHARACTER_NAME.lower() in message.content.lower())
+
+    if is_direct_chat or is_mention_in_listen_mode:
+        is_allowed = (message.channel.id in all_chat_channels or
+                      (message.channel.category and message.channel.category.id in ALLOWED_CATEGORY_IDS))
+        if not is_allowed:
+            return
+
+        if is_direct_chat:
+            if message.channel.id in listening_channels:
+                listening_channels[message.channel.id].cancel()
+            listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
+            logging.info(f"Listen mode activated/reset by direct chat in channel {message.channel.id}.")
+
+        user_message = message.content[len(command_trigger):].strip() if is_direct_chat else message.content
+        if not user_message: return
+
+        if 'date' in user_message.lower() or 'time' in user_message.lower():
+            try:
+                chicago_tz = ZoneInfo("America/Chicago")
+                now = datetime.datetime.now(tz=chicago_tz)
+                time_str = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
+                user_message = f"[Current Time: {time_str}] {user_message}"
+            except Exception as e:
+                logging.error(f"Could not get timezone-aware time: {e}")
+                now = datetime.datetime.now()
+                time_str = now.strftime("%A, %B %d, %Y at %I:%M %p")
+                user_message = f"[Current Time: {time_str}] {user_message}"
+
+        channel_id = message.channel.id
+        if channel_id not in chat_histories:
+            chat_histories[channel_id] = []
+        history = chat_histories[channel_id]
+
+        current_turn_text = f"<start_of_turn>user\n{message.author.display_name}: {user_message}<end_of_turn>"
+        persona_text = f"You are {CHARACTER_NAME}. {CHARACTER_PERSONA}\n\n"
+        tokens_used = get_token_count(persona_text + current_turn_text)
+
+        history_conversation = []
+        for msg in reversed(history):
+            user_prefix = f"{msg['user_name']}: " if msg['user_name'] != CHARACTER_NAME else ""
+            msg_text = f"<start_of_turn>{'model' if msg['user_name'] == CHARACTER_NAME else 'user'}\n{user_prefix}{msg['text']}<end_of_turn>"
+            msg_tokens = get_token_count(msg_text)
+            if tokens_used + msg_tokens > CONTEXT_TOKEN_LIMIT: break
+            history_conversation.insert(0, msg_text)
+            tokens_used += msg_tokens
+
+        full_prompt = persona_text + "\n".join(history_conversation) + "\n" + current_turn_text + "\n<start_of_turn>model\n"
+
+        response_text = await asyncio.to_thread(kobold_api.generate_text, full_prompt)
+
+        if response_text:
+            history.append({"user_name": message.author.display_name, "text": user_message})
+            history.append({"user_name": CHARACTER_NAME, "text": response_text})
+
+            if len(response_text) <= 2000:
+                await message.channel.send(response_text)
+            else: # Handle long messages
+                for i in range(0, len(response_text), 1990):
+                    await message.channel.send(response_text[i:i + 1990])
+                    await asyncio.sleep(1)
+        else:
+            await message.channel.send("Sorry, I couldn't get a response from the character.")
+        return
 
 @bot.event
 async def on_command_error(ctx, error):
     """A global error handler for all bot commands."""
     if isinstance(error, commands.CommandNotFound) or isinstance(error, commands.CheckFailure):
-        return # Ignore commands that don't exist or fail the channel check
-
+        return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(f"Oops! You forgot the prompt. Usage: `{COMMAND_PREFIX}{ctx.command.name} [options] <prompt>`")
     else:
@@ -337,7 +504,7 @@ async def on_command_error(ctx, error):
 
 @bot.command(name="generate", aliases=["generateport", "generateland"],
              help="Generates an image. Aliases: generateport, generateland.")
-@check_permissions()
+@is_allowed_paint_channel()
 async def generate(ctx, *, full_prompt_string: str):
     """Generates an image with a specified orientation and optional arguments.
 
@@ -377,6 +544,18 @@ async def generate(ctx, *, full_prompt_string: str):
         upscale=args.get('upscale', False),
         seed=args.get('seed')
     )
+
+@bot.command(name="clearchat", help="Clears the chat history for this channel.")
+async def clearchat(ctx):
+    """
+    Clears the chat history for the current channel.
+    """
+    channel_id = ctx.channel.id
+    if channel_id in chat_histories:
+        del chat_histories[channel_id]
+        await ctx.send("The chat history for this channel has been cleared.")
+    else:
+        await ctx.send("There is no chat history for this channel to clear.")
 
 # --- Run the Bot ---
 if __name__ == "__main__":

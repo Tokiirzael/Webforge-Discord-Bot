@@ -10,12 +10,19 @@ DISCORD_TOKEN_NAME = "DISCORD_TOKEN"
 COMMAND_PREFIX = "!paint "
 
 # --- Channel Restrictions ---
-# A list of channel IDs where the bot is allowed to work.
-# To get a channel ID, enable Developer Mode in Discord, right-click a channel, and "Copy ID".
-# Leave this list empty to allow the bot in all channels, like: ALLOWED_CHANNEL_IDS = []
-ALLOWED_CHANNEL_IDS = [
-    1390064007037194260,
-    1390064079720153219
+# A list of channel IDs where the bot is allowed to use paint commands.
+PAINT_CHANNEL_IDS = [
+    1390064079720153219,
+    1390064007037194260
+]
+# A list of additional channel IDs where the bot is allowed to chat.
+# The bot can also chat in the PAINT_CHANNEL_IDS.
+CHAT_CHANNEL_IDS = [
+    1405076588156026922
+]
+# A list of category IDs where the bot is allowed to chat.
+ALLOWED_CATEGORY_IDS = [
+    1390063887105130507
 ]
 
 # --- Permission Settings ---
@@ -44,6 +51,20 @@ GENERATION_TIERS = [
 # The address of your running Forge instance.
 FORGE_API_URL = "http://127.0.0.1:7860"
 TXT2IMG_ENDPOINT = "/sdapi/v1/txt2img"
+
+# --- KoboldCpp API Settings ---
+KOBOLDCPP_API_URL = "http://127.0.0.1:5001" # The base URL for your KoboldCpp instance
+KOBOLDCPP_CHAT_ENDPOINT = "/api/v1/generate" # The endpoint for text generation
+
+# --- Character Settings ---
+# This is the character the bot will roleplay as.
+CHARACTER_NAME = "Gemma"
+# This is the persona that will be used in the prompt to the AI.
+CHARACTER_PERSONA = "A helpful and vaguely flirtatious feminine AI assistant who occasionally jokes or teases the users. Speaks with as if she is an eloquent servant. Does not use any kind of emoji. Cannot see images."
+# This is a greeting message the bot can use.
+CHARACTER_GREETING = "Hello! You require my attention? Lovely thing."
+# The maximum number of tokens to include in the context for the AI.
+CONTEXT_TOKEN_LIMIT = 16384
 
 # --- Default Generation Parameters ---
 # These are the base settings for every image generation.

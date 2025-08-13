@@ -65,3 +65,24 @@ After an image is generated, you will see buttons underneath it.
     *   This button appears on all images.
     *   It allows you to delete the image post.
     *   This can only be clicked by the user who originally requested the image or by a server moderator.
+
+### **7. Chatting with the Bot**
+
+Beyond generating images, the bot can also engage in conversation, roleplaying as the character defined in the config.
+
+*   **Direct Chat: `!gemma <message>`**
+    *   To talk directly to the bot, start your message with `!gemma` (or whatever the `CHARACTER_NAME` is in the config, in lowercase).
+    *   Example: `!gemma what is the meaning of life?`
+
+*   **Listen Mode: `!listen` and `!stop`**
+    *   **`!listen`**: Typing this command puts the bot in "listen mode" for 30 minutes. In this mode, you don't need to use the `!gemma` prefix. The bot will respond to any message in the channel that mentions its name (e.g., "Gemma"). Typing `!listen` again resets the 30-minute timer.
+    *   **`!stop`**: This command manually deactivates listen mode and clears the conversation history for the channel.
+
+*   **Clearing History: `!clearchat`**
+    *   This command clears the bot's short-term memory for the current channel, effectively starting a new conversation.
+
+*   **Image Questions**
+    *   If you upload an image and tag the bot (or use a command like `!gemma what is this?`), the bot will try to describe the image's contents.
+
+*   **Time and Date**
+    *   If you include the word "time" or "date" in your chat message, the bot will know the current time and can use it in its response.
