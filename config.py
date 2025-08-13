@@ -7,18 +7,38 @@ DISCORD_TOKEN_NAME = "DISCORD_TOKEN" # The name of the environment variable for 
 COMMAND_PREFIX = "!paint " # The character your bot's commands will start with
 
 # --- Channel Restrictions ---
-# A list of channel IDs where the bot is allowed to respond to commands.
-# To get a channel ID: Enable Developer Mode in Discord (User Settings -> Advanced),
-# then right-click on the channel and select "Copy ID".
-# Example: ALLOWED_CHANNEL_IDS = [123456789012345678, 987654321098765432]
-ALLOWED_CHANNEL_IDS = [
-    1390064007037194260, # Replace with your actual channel ID
-    1390064079720153219  # Add more as needed
-    ]
+# A list of channel IDs where the bot is allowed to respond to !paint commands.
+PAINT_CHANNEL_IDS = [
+    1390064079720153219,
+    1390064007037194260
+]
+# A list of additional channel IDs where the bot is allowed to chat.
+# The bot can also chat in the PAINT_CHANNEL_IDS.
+CHAT_CHANNEL_IDS = [
+    1405076588156026922
+]
+# A list of category IDs where the bot is allowed to chat.
+ALLOWED_CATEGORY_IDS = [
+    1390063887105130507
+]
 
 # --- Stable Diffusion WebUI Forge API Settings ---
 FORGE_API_URL = "http://127.0.0.1:7860" # Default API URL for Forge. Change if yours is different.
 TXT2IMG_ENDPOINT = "/sdapi/v1/txt2img" # The API endpoint for text-to-image generation
+
+# --- KoboldCpp API Settings ---
+KOBOLDCPP_API_URL = "http://127.0.0.1:5001" # The base URL for your KoboldCpp instance
+KOBOLDCPP_CHAT_ENDPOINT = "/api/v1/generate" # The endpoint for text generation
+
+# --- Character Settings ---
+# This is the character the bot will roleplay as.
+CHARACTER_NAME = "Gemma"
+# This is the persona that will be used in the prompt to the AI.
+CHARACTER_PERSONA = "A helpful and vaguely flirtatious feminine AI assistant who occasionally jokes or teases the users. Speaks with as if she is an eloquent servant. Does not use any kind of emoji. Cannot see images."
+# This is a greeting message the bot can use.
+CHARACTER_GREETING = "Hello! You require my attention? Lovely thing."
+# The maximum number of tokens to include in the context for the AI.
+CONTEXT_TOKEN_LIMIT = 16384
 
 # --- Default Stable Diffusion Generation Parameters ---
 # These are the default settings for image generation. Users cannot change these
