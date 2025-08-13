@@ -29,7 +29,7 @@ from config import (
     HIRES_UPSCALER, HIRES_STEPS, HIRES_DENOISING, HIRES_UPSCALE_BY,
     HIRES_RESIZE_WIDTH, HIRES_RESIZE_HEIGHT,
     MSG_GENERATING, MSG_GEN_ERROR, MSG_NO_PROMPT, MSG_API_ERROR,
-    KOBOLDCPP_API_URL, CHARACTER_NAME, CHARACTER_PERSONA, CONTEXT_TOKEN_LIMIT
+    KOBOLDCPP_API_URL, CHARACTER_NAME, CHARACTER_PERSONA, CONTEXT_TOKEN_LIMIT, CHARACTER_GREETING
 )
 from forge_api import ForgeAPIClient
 from kobold_api import KoboldAPIClient
@@ -371,18 +371,32 @@ async def on_message(message):
                 image_bytes = await attachment.read()
                 base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
-                # The new endpoint does not use the text prompt, only the image.
-                response_text = await asyncio.to_thread(
+                # First, get the image caption
+                caption = await asyncio.to_thread(
                     kobold_api.interrogate_image,
                     base64_image=base64_image
                 )
-
                 await message.remove_reaction("🤔", bot.user)
+
+                if not caption:
+                    await message.channel.send("Sorry, I couldn't interpret that image.")
+                    return
+
+                # Now, build a new prompt for the chatbot AI
+                # The user's original message is included for context, if they provided one.
+                user_context = message.content or "What's in this image?"
+                image_prompt = f"{message.author.display_name} sent you a picture. {user_context}\n\n[Image Content: {caption}]"
+
+                # This part is similar to the main chat logic, but simplified for a single turn
+                persona_text = f"You are {CHARACTER_NAME}. {CHARACTER_PERSONA}\n\n"
+                full_prompt = f"{persona_text}<start_of_turn>user\n{image_prompt}<end_of_turn>\n<start_of_turn>model\n"
+
+                response_text = await asyncio.to_thread(kobold_api.generate_text, full_prompt)
 
                 if response_text:
                     await message.channel.send(response_text)
                 else:
-                    await message.channel.send("Sorry, I couldn't interpret that image.")
+                    await message.channel.send("Sorry, I was able to see the image, but I couldn't think of a response.")
 
             except Exception as e:
                 logging.error(f"Error processing image attachment: {e}")
@@ -419,7 +433,7 @@ async def on_message(message):
     # 4. Handle chat logic
     if message.content.lower() == command_trigger:
         # If the user just types the trigger word, respond with the greeting
-        await message.channel.send(config.CHARACTER_GREETING)
+        await message.channel.send(CHARACTER_GREETING)
         return
 
     is_direct_chat = message.content.lower().startswith(command_trigger + " ")
