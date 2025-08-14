@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import shutil
 from pathlib import Path
+import base64
 
 def create_kokoro_script(kokoro_path, text, voice, speed, output_file):
     """Create a temporary Python script that uses Kokoro's internal API"""
@@ -66,10 +67,12 @@ def main():
     parser.add_argument("--output", required=True, help="Output audio file path")
     parser.add_argument("--speed", type=float, default=1.0, help="Speech speed (0.5-2.0, default: 1.0)")
     parser.add_argument("--kokoro-path", help="Path to Kokoro-TTS-Local directory")
+    parser.add_argument("--base64", action="store_true", help="Flag to indicate that the input text is base64 encoded")
     
     args = parser.parse_args()
     
     try:
+        # We print the raw (potentially encoded) text here, the inner script will print the decoded text.
         print(f"Generating speech for: '{args.text}'")
         print(f"Using voice: {args.voice}")
         print(f"Speech speed: {args.speed}x")
@@ -80,7 +83,7 @@ def main():
         
         # Determine Kokoro path
         if args.kokoro_path:
-            kokoro_path = Path(args.kokoro_path)
+            kokoro_path = Path(args.kokoro_path).resolve()
         else:
             # Try to find Kokoro installation
             possible_paths = [
@@ -94,7 +97,7 @@ def main():
             kokoro_path = None
             for path in possible_paths:
                 if path.exists() and (path / "tts_demo.py").exists():
-                    kokoro_path = path
+                    kokoro_path = path.resolve()
                     break
             
             if not kokoro_path:
@@ -133,67 +136,58 @@ sys.path.insert(0, r"{kokoro_path}")
 
 # Try to use the TTS functionality directly
 try:
-    from models import KokoroModel
+    # Import the modern API functions from models.py
+    from models import build_model, generate_speech, get_language_code_from_voice
     import torch
-    import torchaudio
     import soundfile as sf
-    
-    # Initialize the model
-    model = KokoroModel()
-    
-    print("Model loaded successfully")
-    
-    # Generate the audio
-    # Note: The exact method names may vary depending on your Kokoro version
-    # Common patterns in TTS models:
-    audio_data = None
-    
-    # Try different possible method names
-    methods_to_try = [
-        lambda: model.generate(text="{args.text}", voice="{args.voice}", speed={args.speed}),
-        lambda: model.synthesize(text="{args.text}", voice="{args.voice}", speed={args.speed}),
-        lambda: model.tts(text="{args.text}", voice="{args.voice}", speed={args.speed}),
-        lambda: model.speak(text="{args.text}", voice="{args.voice}", speed={args.speed})
-    ]
-    
-    for i, method in enumerate(methods_to_try):
-        try:
-            print(f"Trying method {{i+1}}...")
-            audio_data = method()
-            if audio_data is not None:
-                print(f"Success with method {{i+1}}")
-                break
-        except Exception as e:
-            print(f"Method {{i+1}} failed: {{e}}")
-            continue
-    
-    if audio_data is not None:
-        # Save the audio file
-        if isinstance(audio_data, torch.Tensor):
-            # Convert tensor to numpy if needed
-            if audio_data.dim() > 1:
-                audio_data = audio_data.squeeze()
-            
-            # Save as WAV
-            sf.write(r"{args.output}", audio_data.cpu().numpy(), 24000)
-        else:
-            # Handle other data types
-            sf.write(r"{args.output}", audio_data, 24000)
-        
-        print("Audio saved successfully")
+    import base64
+
+    # Decode text if necessary
+    text_to_generate = "{args.text}"
+    if {args.base64}:
+        text_to_generate = base64.b64decode(text_to_generate).decode('utf-8')
+
+    # Determine device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {{device}}")
+
+    # Build the model using the recommended function
+    # This handles model downloading and setup
+    model = build_model(model_path=None, device=device)
+    print("Model built successfully.")
+
+    # Determine language code from voice
+    lang_code = get_language_code_from_voice("{args.voice}")
+
+    # Generate speech using the recommended function
+    print("Generating speech...")
+    audio_tensor, _ = generate_speech(
+        model=model,
+        text=text_to_generate,
+        voice="{args.voice}",
+        lang=lang_code,
+        device=device,
+        speed={args.speed}
+    )
+
+    # Save the output file
+    if audio_tensor is not None:
+        print(f"Saving audio to {args.output}...")
+        sf.write(r"{args.output}", audio_tensor.cpu().numpy(), 24000)
+        print("Audio saved successfully.")
     else:
-        print("Error: No audio data generated")
+        print("Error: Speech generation failed, returned no audio data.")
         sys.exit(1)
-        
+
 except Exception as e:
-    print(f"Error: {{e}}")
+    print(f"An error occurred: {{e}}")
     import traceback
     traceback.print_exc()
     sys.exit(1)
 '''
             
             # Write the automation script to a temporary file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8') as f:
                 f.write(automation_script)
                 temp_script = f.name
             

@@ -6,6 +6,7 @@ import logging
 import os
 import requests
 from pathlib import Path
+import base64
 
 from config import KOKORO_LOCAL_PATH, KOKORO_PYTHON_PATH, KOKORO_SCRIPT_PATH, KOKORO_OUTPUT_FILE, KOKORO_VOICE
 
@@ -48,13 +49,17 @@ class KokoroTTSClient:
         Generate speech using the local wrapper script.
         """
         try:
-            # Construct the command to call our wrapper script
+            # Encode text to base64 to safely pass multi-line strings and special characters
+            encoded_text = base64.b64encode(text.encode('utf-8')).decode('ascii')
+
+            # Construct the command to call our wrapper script, ensuring all parts are strings
             cmd = [
-                self.python_path,
-                self.script_path,
-                "--text", text,
+                str(self.python_path),
+                str(self.script_path),
+                "--text", encoded_text,
                 "--voice", self.voice,
-                "--output", self.output_file
+                "--output", str(self.output_file),
+                "--base64"  # Flag to tell the wrapper to decode the text
             ]
             
             # Add kokoro-path if specified
@@ -63,11 +68,16 @@ class KokoroTTSClient:
             
             logging.info(f"Executing TTS command: {' '.join(cmd)}")
             
+            # Set up the environment to ensure UTF-8 output from the subprocess
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+
             # Run the command asynchronously with a timeout
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                env=env
             )
             
             try:
@@ -80,9 +90,9 @@ class KokoroTTSClient:
             
             # Log output for debugging
             if stdout:
-                logging.info(f"TTS STDOUT: {stdout.decode()}")
+                logging.info(f"TTS STDOUT: {stdout.decode('utf-8', errors='ignore')}")
             if stderr:
-                logging.error(f"TTS STDERR: {stderr.decode()}")
+                logging.error(f"TTS STDERR: {stderr.decode('utf-8', errors='ignore')}")
             
             if process.returncode == 0:
                 # Verify the output file was created

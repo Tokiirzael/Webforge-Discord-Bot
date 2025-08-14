@@ -1,4 +1,9 @@
 # config.py
+from pathlib import Path
+
+# --- Base Directory ---
+# Get the absolute path of the directory where this config file is located
+BASE_DIR = Path(__file__).resolve().parent
 
 # --- Discord Bot Settings ---
 # The name of the environment variable for your bot token.
@@ -65,18 +70,18 @@ KOBOLDCPP_API_URL = "http://127.0.0.1:5001" # The base URL for your KoboldCpp in
 KOBOLDCPP_CHAT_ENDPOINT = "/api/v1/generate" # The endpoint for text generation
 
 # --- Kokoro TTS Settings (For PierrunoYT/Kokoro-TTS-Local) ---
-# Path to your Kokoro-TTS-Local installation directory
-KOKORO_LOCAL_PATH = "F:/Kokoro"  # Update this to your actual Kokoro installation path
+# Path to your Kokoro-TTS-Local installation directory (relative to this config file)
+KOKORO_SUBDIR = "Kokoro-TTS-Local"
+KOKORO_LOCAL_PATH = BASE_DIR / KOKORO_SUBDIR
 
 # Path to Python executable in your Kokoro environment
-# This should point to the Python in your Kokoro virtual environment
-KOKORO_PYTHON_PATH = "F:/Kokoro/venv/Scripts/python.exe"  # Update this path
+KOKORO_PYTHON_PATH = KOKORO_LOCAL_PATH / "venv" / "Scripts" / "python.exe"
 
-# Path to the TTS script - we'll create a wrapper script for this
-KOKORO_SCRIPT_PATH = "./kokoro_tts_local.py"
+# Path to the TTS script
+KOKORO_SCRIPT_PATH = BASE_DIR / "kokoro_tts_local_wrapper.py"
 
-# Output file path (will be overwritten for each generation)
-KOKORO_OUTPUT_FILE = "./temp_audio/gemma_speech.wav"
+# Output file path for generated audio
+KOKORO_OUTPUT_FILE = BASE_DIR / "temp_audio" / "gemma_speech.wav"
 
 # Voice to use - available voices from Kokoro-TTS-Local
 KOKORO_VOICE = "af_bella"  # Options: af_bella, af_sarah, af_sky, af_nicole, am_adam, am_michael, etc.

@@ -75,15 +75,14 @@ async def process_tts_queue():
     while True:
         try:
             # Get the next TTS request from the queue
-            tts_request = await tts_queue.get()
+            ctx, text = await tts_queue.get()
             
-            if tts_request is None:  # Shutdown signal
+            if ctx is None:  # Shutdown signal
                 break
                 
-            ctx, text, original_message = tts_request
-            
             try:
                 # Generate the speech
+                await ctx.channel.send(MSG_TTS_GENERATING, delete_after=10)
                 success = await asyncio.wait_for(
                     kokoro_api.generate_speech(text), 
                     timeout=TTS_TIMEOUT
@@ -101,24 +100,24 @@ async def process_tts_queue():
                                 description="Gemma's voice response"
                             )
                             
-                            await ctx.send(
+                            await ctx.channel.send(
                                 f"🔊 **Audio response for {ctx.author.mention}:**", 
                                 file=discord_file
                             )
                         
                         logging.info(f"TTS audio sent successfully for user {ctx.author}")
                     else:
-                        await ctx.send(MSG_TTS_ERROR)
+                        await ctx.channel.send(MSG_TTS_ERROR)
                         logging.error("TTS file was generated but not found on disk")
                 else:
-                    await ctx.send(MSG_TTS_ERROR)
+                    await ctx.channel.send(MSG_TTS_ERROR)
                     logging.error("TTS generation failed")
                     
             except asyncio.TimeoutError:
-                await ctx.send("Speech generation timed out. The text response is still available above.")
+                await ctx.channel.send("Speech generation timed out. The text response is still available above.")
                 logging.error(f"TTS generation timed out for user {ctx.author}")
             except Exception as e:
-                await ctx.send(MSG_TTS_ERROR)
+                await ctx.channel.send(MSG_TTS_ERROR)
                 logging.error(f"Error during TTS processing: {e}")
             finally:
                 # Mark this task as done
@@ -131,13 +130,13 @@ async def process_tts_queue():
     
     tts_processing = False
 
-async def add_to_tts_queue(ctx, text, original_message):
+async def add_to_tts_queue(ctx, text):
     """Adds a TTS request to the queue if there's room."""
-    if tts_queue.qsize() >= MAX_CONCURRENT_TTS * 3:  # Allow some buffer
-        await ctx.send(MSG_TTS_QUEUE_FULL)
+    if tts_queue.qsize() >= MAX_CONCURRENT_TTS:
+        await ctx.channel.send(MSG_TTS_QUEUE_FULL, delete_after=10)
         return False
     
-    await tts_queue.put((ctx, text, original_message))
+    await tts_queue.put((ctx, text))
     return True
 
 # --- Helper Functions ---
@@ -237,6 +236,175 @@ def is_allowed_paint_channel():
             return False
     return commands.check(predicate)
 
+# --- UI Components ---
+
+class GenerationView(discord.ui.View):
+    """
+    A view that holds the state of a generation and contains the action buttons.
+    """
+    def __init__(self, original_ctx, prompt, seed, preset_name, is_upscaled: bool):
+        super().__init__(timeout=3600) # 1-hour timeout for the buttons
+        self.original_ctx = original_ctx
+        self.prompt = prompt
+        self.seed = seed
+        self.preset_name = preset_name
+
+        # The "Upscale" and "Rerun" buttons should not be shown if the image is already an upscale.
+        if is_upscaled:
+            self.upscale_button.disabled = True
+            self.upscale_button.style = discord.ButtonStyle.secondary
+            self.rerun_button.disabled = True
+
+    async def on_timeout(self):
+        # When the view times out, disable all components
+        for item in self.children:
+            item.disabled = True
+        # Update the original message to reflect the disabled state
+        await self.message.edit(view=self)
+
+    @discord.ui.button(label="Upscale", style=discord.ButtonStyle.primary)
+    async def upscale_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Callback for the upscale button."""
+        # Acknowledge the click immediately
+        await interaction.response.send_message(f"Upscaling image for {interaction.user.mention}...", ephemeral=True)
+
+        # Disable the button after it's clicked
+        button.disabled = True
+        button.label = "Upscaled"
+        await self.message.edit(view=self)
+
+        # Call the generation function with the stored parameters, but force upscale=True
+        await _generate_image(
+            ctx=self.original_ctx,
+            prompt=self.prompt,
+            preset_name=self.preset_name,
+            upscale=True,
+            seed=self.seed
+        )
+
+    @discord.ui.button(label="Rerun", style=discord.ButtonStyle.secondary, emoji="🔄")
+    async def rerun_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Callback for the rerun button."""
+        await interaction.response.send_message(f"Rerunning prompt for {interaction.user.mention} with a new seed...", ephemeral=True)
+
+        # Call the generation function with the same prompt but a random seed
+        await _generate_image(
+            ctx=self.original_ctx,
+            prompt=self.prompt,
+            preset_name=self.preset_name,
+            upscale=False, # A rerun is not an upscale
+            seed=-1 # Use a random seed
+        )
+
+    @discord.ui.button(label="Delete", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Callback for the delete button."""
+
+        # Check for permissions
+        is_original_author = interaction.user.id == self.original_ctx.author.id
+        # Get the user's roles, check if any of them are in the moderator list
+        is_moderator = any(role.id in MODERATOR_ROLE_IDS for role in interaction.user.roles)
+
+        if not is_original_author and not is_moderator:
+            await interaction.response.send_message("You don't have permission to delete this.", ephemeral=True)
+            return
+
+        # If permission check passes, delete the message.
+        await self.message.delete()
+        await interaction.response.send_message("Image deleted.", ephemeral=True)
+
+async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, seed: int = None):
+    """Prepares the payload and calls the Forge API to generate an image."""
+    if not prompt:
+        await ctx.send(MSG_NO_PROMPT)
+        return
+
+    resolution = RESOLUTIONS.get(preset_name, {})
+    width, height = resolution.get("width"), resolution.get("height")
+    if not width or not height:
+        logging.error(f"Invalid resolution preset '{preset_name}' used.")
+        await ctx.send("An internal error occurred with resolution settings.")
+        return
+
+    # Split the prompt into positive and negative parts
+    user_positive, user_negative = (p.strip() for p in prompt.split("::", 1)) if "::" in prompt else (prompt, "")
+
+    final_positive_prompt = f"{BASE_POSITIVE_PROMPT}, {user_positive}".strip(", ")
+    combined_negative_prompt = f"{user_negative}, {BASE_NEGATIVE_PROMPT}".strip(", ")
+    final_negative_prompt = clean_negative_prompt(combined_negative_prompt)
+
+    generation_seed = seed if seed is not None else DEFAULT_SEED
+
+    # --- Construct the main payload for the Forge API ---
+    payload = {
+        "prompt": final_positive_prompt, "negative_prompt": final_negative_prompt,
+        "steps": DEFAULT_STEPS, "cfg_scale": DEFAULT_CFG_SCALE,
+        "sampler_name": DEFAULT_SAMPLER_NAME, "seed": generation_seed,
+        "width": width, "height": height, "clip_skip": DEFAULT_CLIP_SKIP,
+        "override_settings": {"sd_model_checkpoint": DEFAULT_MODEL},
+        "alwayson_scripts": {}
+    }
+
+    # If --upscale is used, add the Hires.fix script settings
+    if upscale:
+        payload["alwayson_scripts"]["img2img hires fix"] = {"args": [{"hr_upscaler": HIRES_UPSCALER, "hr_second_pass_steps": HIRES_STEPS, "denoising_strength": HIRES_DENOISING, "hr_scale": HIRES_UPSCALE_BY, "hr_sampler": "Euler a", "hr_resize_x": HIRES_RESIZE_WIDTH, "hr_resize_y": HIRES_RESIZE_HEIGHT}]}
+
+    # If ADetailer is enabled in the config, add its script settings
+    if ADETAILER_ENABLED_BY_DEFAULT:
+        payload["alwayson_scripts"]["ADetailer"] = {"args": [{"ad_model": ADETAILER_DETECTION_MODEL, "ad_prompt": ADETAILER_PROMPT, "ad_negative_prompt": ADETAILER_NEGATIVE_PROMPT, "ad_confidence": ADETAILER_CONFIDENCE, "ad_mask_blur": ADETAILER_MASK_BLUR, "ad_denoising_strength": ADETAILER_INPAINT_DENOISING, "ad_inpaint_only_masked": ADETAILER_INPAINT_ONLY_MASKED, "ad_inpaint_padding": ADETAILER_INPAINT_PADDING}]}
+
+    # --- Send request and handle response ---
+    await ctx.send(f"{MSG_GENERATING} (`{preset_name}`)")
+    logging.info(f"User '{ctx.author}' request: Upscale={upscale}, Seed={generation_seed}, Prompt='{prompt}'")
+
+    image, info_json = await asyncio.to_thread(forge_api.txt2img, payload)
+
+    if image and info_json:
+        # --- Stat Tracking ---
+        user_id_str = str(ctx.author.id)
+        user_stats[user_id_str] = user_stats.get(user_id_str, 0) + 1
+        save_stats(user_stats)
+
+        generation_count = user_stats[user_id_str]
+        user_title = get_user_title(generation_count)
+
+        # --- Message Formatting ---
+        try:
+            info_data = json.loads(info_json)
+            final_seed = info_data.get("seed", "unknown")
+        except json.JSONDecodeError:
+            final_seed = "unknown"
+
+        # Build the response string
+        response_parts = []
+        if user_title:
+            response_parts.append(f"Title: {user_title}")
+        response_parts.append(f"Generation #{generation_count}")
+        response_parts.append(f"Seed: `{final_seed}`")
+
+        response_text = f"Here's your image, {ctx.author.mention}! ({' | '.join(response_parts)})"
+
+        with io.BytesIO() as image_binary:
+            image.save(image_binary, 'PNG')
+            image_binary.seek(0)
+            discord_file = discord.File(fp=image_binary, filename=f"seed_{final_seed}.png")
+
+            view = GenerationView(
+                original_ctx=ctx,
+                prompt=prompt,
+                seed=final_seed,
+                preset_name=preset_name,
+                is_upscaled=upscale
+            )
+
+            message = await ctx.send(response_text, file=discord_file, view=view)
+            view.message = message # Store message for view timeout
+
+            logging.info(f"Image sent for '{ctx.author}'. Seed: {final_seed}, Total Gens: {generation_count}")
+    else:
+        await ctx.send(MSG_GEN_ERROR)
+        logging.error("Failed to get image from Forge API.")
+
 # --- Chat Response Generation ---
 async def generate_chat_response(message, user_message: str):
     """Generates a chat response using the same logic as the existing chat system."""
@@ -307,4 +475,202 @@ async def generate_chat_response(message, user_message: str):
         return response_text
     else:
         return None
+
+# --- Bot Events ---
+
+@bot.event
+async def on_ready():
+    """Called when the bot successfully connects to Discord."""
+    global user_stats
+    user_stats = load_stats()
+    logging.info(f'Logged in as {bot.user}')
+    if not tts_processing:
+        bot.loop.create_task(process_tts_queue())
+        logging.info("TTS queue processor started.")
+    await bot.change_presence(activity=discord.Game(name=f"Art & Chat"))
+
+@bot.event
+async def on_shutdown():
+    """Event that runs when the bot is shutting down."""
+    await tts_queue.put((None, None))  # Send shutdown signal (ctx, text)
+    logging.info("TTS queue shutdown signal sent.")
+    await asyncio.sleep(1)
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+
+    all_chat_channels = PAINT_CHANNEL_IDS + CHAT_CHANNEL_IDS
+    is_allowed_channel = (message.channel.id in all_chat_channels or (message.channel.category and message.channel.category.id in ALLOWED_CATEGORY_IDS))
+
+    if message.attachments and "image" in message.attachments[0].content_type and is_allowed_channel:
+        try:
+            await message.add_reaction("🤔")
+            image_bytes = await message.attachments[0].read()
+            base64_image = base64.b64encode(image_bytes).decode('utf-8')
+            caption = await asyncio.to_thread(kobold_api.interrogate_image, base64_image=base64_image)
+            await message.remove_reaction("🤔", bot.user)
+            if not caption:
+                await message.channel.send("Sorry, I couldn't interpret that image.")
+                return
+            user_context = message.content or "What's in this image?"
+            image_prompt = f"{message.author.display_name} sent you a picture. {user_context}\n\n[Image Content: {caption}]"
+            response_text = await generate_chat_response(message, image_prompt)
+            if response_text:
+                await message.channel.send(response_text)
+                # Only generate speech if the user's original message contained "speak"
+                if "speak" in message.content.lower():
+                    await add_to_tts_queue(message, response_text)
+            else:
+                await message.channel.send("Sorry, I was able to see the image, but I couldn't think of a response.")
+        except Exception as e:
+            logging.error(f"Error processing image attachment: {e}")
+            await message.channel.send("Sorry, an error occurred while processing the image.")
+        return
+
+    if message.content.startswith(COMMAND_PREFIX):
+        await bot.process_commands(message)
+        return
+
+    command_trigger = "!" + CHARACTER_NAME.lower()
+
+    if message.content.lower() == '!stop':
+        if message.channel.id in listening_channels:
+            task = listening_channels.pop(message.channel.id)
+            task.cancel()
+            if message.channel.id in chat_histories:
+                del chat_histories[message.channel.id]
+            await message.channel.send("**Listen mode has been manually deactivated. Chat history for this session has been cleared.**")
+        return
+
+    if message.content.lower() == '!listen':
+        if message.channel.id in listening_channels:
+            listening_channels[message.channel.id].cancel()
+        listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
+        await message.channel.send("Listen mode timer has been reset for another 30 minutes.")
+        return
+
+    if message.content.lower() == command_trigger:
+        await message.channel.send(CHARACTER_GREETING)
+        return
+
+    is_direct_chat = message.content.lower().startswith(command_trigger + " ")
+    is_mention_in_listen_mode = (message.channel.id in listening_channels and CHARACTER_NAME.lower() in message.content.lower())
+
+    if (is_direct_chat or is_mention_in_listen_mode) and is_allowed_channel:
+        if is_direct_chat:
+            if message.channel.id in listening_channels:
+                listening_channels[message.channel.id].cancel()
+            listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
+
+        user_message = message.content[len(command_trigger):].strip() if is_direct_chat else message.content
+        if not user_message: return
+
+        response_text = await generate_chat_response(message, user_message)
+        if response_text:
+            if len(response_text) <= 2000:
+                await message.channel.send(response_text)
+            else:
+                for i in range(0, len(response_text), 1990):
+                    await message.channel.send(response_text[i:i + 1990])
+                    await asyncio.sleep(1)
+            # Only generate speech if the user's original message contained "speak"
+            if "speak" in user_message.lower():
+                await add_to_tts_queue(message, response_text)
+        else:
+            await message.channel.send("Sorry, I couldn't get a response from the character.")
+        return
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound) or isinstance(error, commands.CheckFailure):
+        return
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Oops! You forgot the prompt. Usage: `{COMMAND_PREFIX}{ctx.command.name} [options] <prompt>`")
+    else:
+        await ctx.send(MSG_GEN_ERROR)
+        logging.error(f"An unhandled error occurred in command {ctx.command}: {error}", exc_info=True)
+
+# --- Bot Commands ---
+
+@bot.command(name="generate", aliases=["generateport", "generateland"], help="Generates an image. Aliases: generateport, generateland.")
+@is_allowed_paint_channel()
+async def generate(ctx, *, full_prompt_string: str):
+    try:
+        args, cleaned_prompt = parse_generate_args(full_prompt_string)
+    except ValueError as e:
+        await ctx.send(f"Error parsing arguments: {e}. Please check your command format.")
+        return
+    invoked_command = ctx.invoked_with.lower()
+    preset_name = "square"
+    if invoked_command == "generateport":
+        preset_name = "portrait"
+    elif invoked_command == "generateland":
+        preset_name = "landscape"
+    await _generate_image(ctx, prompt=cleaned_prompt, preset_name=preset_name, upscale=args.get('upscale', False), seed=args.get('seed'))
+
+@bot.command(name="clearchat", help="Clears the chat history for this channel.")
+async def clearchat(ctx):
+    channel_id = ctx.channel.id
+    if channel_id in chat_histories:
+        del chat_histories[channel_id]
+        await ctx.send("The chat history for this channel has been cleared.")
+    else:
+        await ctx.send("There is no chat history for this channel to clear.")
+
+@bot.command(name="setprofile", help="Sets your user profile for the chatbot.")
+async def setprofile(ctx, *, profile_text: str):
+    """Saves or updates a user's profile text."""
+    if not profile_text:
+        await ctx.send("Please provide some text for your profile. Example: `!paint setprofile A friendly artist from Canada.`")
+        return
+    try:
+        os.makedirs(PROFILE_DIR, exist_ok=True)
+        file_path = os.path.join(PROFILE_DIR, f"{ctx.author.id}.txt")
+        file_content = f"[[ {profile_text} ]]"
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(file_content)
+        await ctx.send(f"Your profile has been saved, {ctx.author.mention}!")
+        logging.info(f"Saved profile for user {ctx.author.id}")
+    except Exception as e:
+        logging.error(f"Failed to save profile for user {ctx.author.id}: {e}")
+        await ctx.send("Sorry, there was an error saving your profile.")
+
+@bot.command(name="viewprofile", help="View your current user profile.")
+async def viewprofile(ctx):
+    """Displays the user's current profile to them privately."""
+    try:
+        file_path = os.path.join(PROFILE_DIR, f"{ctx.author.id}.txt")
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                profile_content = f.read()
+            await ctx.send(f"Here is your current profile, {ctx.author.mention}:\n```\n{profile_content}\n```", ephemeral=True)
+        else:
+            await ctx.send("You don't have a profile set up yet. Use `!paint setprofile <text>` to create one.", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Failed to view profile for user {ctx.author.id}: {e}")
+        await ctx.send("Sorry, there was an error retrieving your profile.", ephemeral=True)
+
+@bot.command(name="deleteprofile", help="Deletes your user profile.")
+async def deleteprofile(ctx):
+    """Deletes the user's profile file."""
+    try:
+        file_path = os.path.join(PROFILE_DIR, f"{ctx.author.id}.txt")
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            await ctx.send(f"Your profile has been deleted, {ctx.author.mention}.")
+            logging.info(f"Deleted profile for user {ctx.author.id}")
+        else:
+            await ctx.send("You don't have a profile to delete.", ephemeral=True)
+    except Exception as e:
+        logging.error(f"Failed to delete profile for user {ctx.author.id}: {e}")
+        await ctx.send("Sorry, there was an error deleting your profile.")
+
+# --- Run the Bot ---
+if __name__ == "__main__":
+    try:
+        bot.run(DISCORD_TOKEN)
+    finally:
+        logging.info("Bot is shutting down.")
         
