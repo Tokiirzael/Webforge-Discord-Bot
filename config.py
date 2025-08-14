@@ -104,6 +104,8 @@ CHARACTER_GREETING = "Hello! You require my attention? Lovely thing."
 # A mapping of common user-provided timezone names to their official IANA DB names.
 # This allows the bot to understand natural language requests for time.
 # The key (e.g., "cst") must be lowercase.
+# IMPORTANT: Always map to location-based names (e.g., "America/Chicago") instead of
+# fixed abbreviations (e.g., "CST"). This ensures Daylight Saving Time is handled automatically.
 TIMEZONE_MAP = {
     "pst": "America/Los_Angeles",
     "pdt": "America/Los_Angeles",

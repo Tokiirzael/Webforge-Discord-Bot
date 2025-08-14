@@ -412,8 +412,11 @@ async def generate_chat_response(message, user_message: str):
     if 'date' in user_message.lower() or 'time' in user_message.lower():
         # Timezone detection
         tz_name = "America/Chicago" # Default timezone
+        # Use regex to find whole-word matches for timezone keys
+        import re
         for tz_key, tz_value in TIMEZONE_MAP.items():
-            if tz_key in user_message.lower():
+            # \b ensures we match whole words only
+            if re.search(r'\b' + re.escape(tz_key) + r'\b', user_message, re.IGNORECASE):
                 tz_name = tz_value
                 break
         
