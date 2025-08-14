@@ -1,258 +1,310 @@
 # bot.py
 
 import logging
-# Configure logging for more detailed console output
-logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
-
-
 import discord
 from discord.ext import commands
 import os
 from dotenv import load_dotenv
-import asyncio # For asynchronous operations
+import asyncio
 import io
+import json
+import shlex
+import argparse
 
-# Import our custom modules
+import datetime
+from zoneinfo import ZoneInfo
+import base64
+
+# Import settings from the config file
 from config import (
-    DISCORD_TOKEN_NAME, COMMAND_PREFIX, FORGE_API_URL, TXT2IMG_ENDPOINT,
-    ALLOWED_CHANNEL_IDS,
+    DISCORD_TOKEN_NAME, COMMAND_PREFIX, PAINT_CHANNEL_IDS, CHAT_CHANNEL_IDS, ALLOWED_CATEGORY_IDS,
+    MODERATOR_ROLE_IDS, GENERATION_ROLE_ID,
+    STATS_FILE, PROFILE_DIR, GENERATION_TIERS,
     DEFAULT_STEPS, DEFAULT_CFG_SCALE, DEFAULT_SAMPLER_NAME, DEFAULT_SEED, DEFAULT_MODEL,
-    DEFAULT_CLIP_SKIP,
-    RESOLUTIONS, DEFAULT_RESOLUTION_PRESET,
-    FORBIDDEN_NEGATIVE_TERMS,
+    DEFAULT_CLIP_SKIP, RESOLUTIONS, FORBIDDEN_NEGATIVE_TERMS,
     BASE_POSITIVE_PROMPT, BASE_NEGATIVE_PROMPT,
-    # --- NO HIRES.FIX IMPORTS HERE ---
-    # --- ADETAILER IMPORTS ---
-    ADETAILER_ENABLED_BY_DEFAULT, ADETAILER_DETECTION_MODEL,
-    ADETAILER_PROMPT, ADETAILER_NEGATIVE_PROMPT,
-    ADETAILER_CONFIDENCE, ADETAILER_MASK_BLUR, ADETAILER_INPAINT_DENOISING, ADETAILER_INPAINT_ONLY_MASKED,
-    ADETAILER_INPAINT_PADDING,
-    MSG_INVALID_RES, MSG_RES_SET,
-    # MSG_UPSCALE_ENABLED, MSG_UPSCALE_DISABLED, # Removed, as !upscale command is gone
-    MSG_GENERATING, MSG_GEN_ERROR, MSG_NO_PROMPT, MSG_API_ERROR
+    ADETAILER_ENABLED_BY_DEFAULT, ADETAILER_DETECTION_MODEL, ADETAILER_PROMPT,
+    ADETAILER_NEGATIVE_PROMPT, ADETAILER_CONFIDENCE, ADETAILER_MASK_BLUR,
+    ADETAILER_INPAINT_DENOISING, ADETAILER_INPAINT_ONLY_MASKED, ADETAILER_INPAINT_PADDING,
+    HIRES_UPSCALER, HIRES_STEPS, HIRES_DENOISING, HIRES_UPSCALE_BY,
+    HIRES_RESIZE_WIDTH, HIRES_RESIZE_HEIGHT,
+    MSG_GENERATING, MSG_GEN_ERROR, MSG_NO_PROMPT, MSG_API_ERROR,
+    KOBOLDCPP_API_URL, CHARACTER_NAME, CHARACTER_PERSONA, CONTEXT_TOKEN_LIMIT, CHARACTER_GREETING, TIMEZONE_MAP,
+    # TTS Settings
+    MAX_CONCURRENT_TTS, TTS_TIMEOUT, MSG_TTS_GENERATING, MSG_TTS_ERROR, MSG_TTS_QUEUE_FULL
 )
 from forge_api import ForgeAPIClient
+from kobold_api import KoboldAPIClient
+from kokoro_api import KokoroTTSClient
 
-# Load environment variables from .env file
+# Configure basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
+
+# Load environment variables from a .env file
 load_dotenv()
 
 # --- Bot Initialization ---
 DISCORD_TOKEN = os.getenv(DISCORD_TOKEN_NAME)
 if not DISCORD_TOKEN:
-    print(f"Error: {DISCORD_TOKEN_NAME} environment variable not set.")
-    print(f"Please create a .env file with {DISCORD_TOKEN_NAME}=YOUR_BOT_TOKEN")
+    print(f"Error: {DISCORD_TOKEN_NAME} not found in environment variables.")
     exit()
 
+# Define the bot's intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+forge_api = ForgeAPIClient()
+kobold_api = KoboldAPIClient(base_url=KOBOLDCPP_API_URL)
+kokoro_api = KokoroTTSClient()
 
-# --- Global Bot State (These will hold our current settings) ---
-current_width = RESOLUTIONS[DEFAULT_RESOLUTION_PRESET]["width"]
-current_height = RESOLUTIONS[DEFAULT_RESOLUTION_PRESET]["height"]
-current_preset_name = DEFAULT_RESOLUTION_PRESET
+user_stats = {} # In-memory cache for user generation stats
+chat_histories = {} # key: channel_id, value: list of messages
+listening_channels = {} # {channel_id: asyncio.Task}
 
-# 'enable_upscale' is no longer needed as Hires.fix is removed and not user-toggleable
-# If you want to control ADetailer on/off, use ADETAILER_ENABLED_BY_DEFAULT directly.
+# --- TTS Queue System ---
+tts_queue = asyncio.Queue()
+tts_processing = False
 
-forge_api = ForgeAPIClient(base_url=FORGE_API_URL)
+async def process_tts_queue():
+    """Processes TTS requests one at a time from the queue."""
+    global tts_processing
+    tts_processing = True
+    
+    while True:
+        try:
+            # Get the next TTS request from the queue
+            tts_request = await tts_queue.get()
+            
+            if tts_request is None:  # Shutdown signal
+                break
+                
+            ctx, text, original_message = tts_request
+            
+            try:
+                # Generate the speech
+                success = await asyncio.wait_for(
+                    kokoro_api.generate_speech(text), 
+                    timeout=TTS_TIMEOUT
+                )
+                
+                if success:
+                    # Send the audio file
+                    audio_file_path = kokoro_api.get_output_file_path()
+                    
+                    if os.path.exists(audio_file_path):
+                        with open(audio_file_path, 'rb') as audio_file:
+                            discord_file = discord.File(
+                                fp=audio_file, 
+                                filename=f"gemma_speech.wav",
+                                description="Gemma's voice response"
+                            )
+                            
+                            await ctx.send(
+                                f"🔊 **Audio response for {ctx.author.mention}:**", 
+                                file=discord_file
+                            )
+                        
+                        logging.info(f"TTS audio sent successfully for user {ctx.author}")
+                    else:
+                        await ctx.send(MSG_TTS_ERROR)
+                        logging.error("TTS file was generated but not found on disk")
+                else:
+                    await ctx.send(MSG_TTS_ERROR)
+                    logging.error("TTS generation failed")
+                    
+            except asyncio.TimeoutError:
+                await ctx.send("Speech generation timed out. The text response is still available above.")
+                logging.error(f"TTS generation timed out for user {ctx.author}")
+            except Exception as e:
+                await ctx.send(MSG_TTS_ERROR)
+                logging.error(f"Error during TTS processing: {e}")
+            finally:
+                # Mark this task as done
+                tts_queue.task_done()
+                
+        except Exception as e:
+            logging.error(f"Critical error in TTS queue processor: {e}")
+            # Continue processing other requests
+            continue
+    
+    tts_processing = False
 
-# --- Helper Functions for Prompts ---
+async def add_to_tts_queue(ctx, text, original_message):
+    """Adds a TTS request to the queue if there's room."""
+    if tts_queue.qsize() >= MAX_CONCURRENT_TTS * 3:  # Allow some buffer
+        await ctx.send(MSG_TTS_QUEUE_FULL)
+        return False
+    
+    await tts_queue.put((ctx, text, original_message))
+    return True
+
+# --- Helper Functions ---
+
+def load_stats():
+    """Loads user stats from the JSON file."""
+    if os.path.exists(STATS_FILE):
+        with open(STATS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
+
+def save_stats(stats_dict):
+    """Saves the given stats dictionary to the JSON file."""
+    with open(STATS_FILE, 'w') as f:
+        json.dump(stats_dict, f, indent=4)
+
+def parse_generate_args(prompt_string: str):
+    """
+    Parses command-line style arguments from the prompt string.
+    Recognizes --upscale and --seed=<number>.
+    """
+    # Custom parser to avoid exiting the program on a parsing error
+    class NonExitingArgumentParser(argparse.ArgumentParser):
+        def error(self, message):
+            raise ValueError(message)
+
+    parser = NonExitingArgumentParser(add_help=False, allow_abbrev=False)
+    parser.add_argument('--upscale', action='store_true')
+    parser.add_argument('--seed', type=int)
+
+    # shlex helps split the string while respecting quoted sections
+    words = shlex.split(prompt_string)
+    
+    try:
+        # Let argparse handle separating known args from the rest of the prompt
+        namespace, prompt_words = parser.parse_known_args(words)
+        parsed_args = vars(namespace)
+    except (ValueError, argparse.ArgumentError) as e:
+        # If parsing fails, assume the whole string was a prompt with no valid args
+        logging.warning(f"Could not parse args, treating as full prompt. Details: {e}")
+        parsed_args = {}
+        prompt_words = words
+
+    cleaned_prompt = ' '.join(prompt_words)
+    return parsed_args, cleaned_prompt
+
 def clean_negative_prompt(user_negative_prompt: str) -> str:
-    """
-    Adjusts the user-provided negative prompt by removing forbidden terms.
-    This ensures distasteful content is less likely to be generated.
-    """
+    """Removes forbidden terms from the user's negative prompt for safety."""
     cleaned_prompt = user_negative_prompt
     for term in FORBIDDEN_NEGATIVE_TERMS:
         cleaned_prompt = cleaned_prompt.replace(term, "", -1).replace(term.capitalize(), "", -1)
-        cleaned_prompt = cleaned_prompt.replace(term.upper(), "", -1)
-    cleaned_prompt = " ".join(cleaned_prompt.split()).strip()
-    return cleaned_prompt
+    return " ".join(cleaned_prompt.split()).strip()
 
-# --- NEW CHECK FUNCTION ---
-def is_allowed_channel():
-    """Custom check to ensure commands are only run in allowed channels."""
+def get_user_title(count: int) -> str:
+    """Returns a user's title based on their generation count."""
+    # The GENERATION_TIERS list is sorted from highest to lowest.
+    # We iterate through it and return the first title the user qualifies for.
+    for threshold, title in GENERATION_TIERS:
+        if count >= threshold:
+            return title
+    return "" # Return an empty string if no tier is met
+
+def get_token_count(text: str) -> int:
+    """Approximates the number of tokens in a string (1 token ~ 4 chars)."""
+    return len(text) // 4
+
+async def listening_timer(channel: discord.TextChannel):
+    """Manages the 30-minute timer for listen mode."""
+    try:
+        await asyncio.sleep(29 * 60)
+        warning_message = (
+            f"**Attention:** Listen mode will automatically turn off in 60 seconds. "
+            f"Type `!listen` to reset the timer for another 30 minutes."
+        )
+        await channel.send(warning_message)
+        await asyncio.sleep(60)
+
+        if channel.id in listening_channels:
+            del listening_channels[channel.id]
+            if channel.id in chat_histories:
+                del chat_histories[channel.id]
+            await channel.send("**Listen mode has been deactivated. Chat history for this session has been cleared.**")
+    except asyncio.CancelledError:
+        logging.info(f"Listen mode timer for channel {channel.id} was cancelled (likely reset).")
+    except Exception as e:
+        logging.error(f"An error occurred in the listening timer for channel {channel.id}: {e}")
+        if channel.id in listening_channels:
+            del listening_channels[channel.id]
+
+def is_allowed_paint_channel():
+    """A custom check to ensure bot commands only run in specified paint channels."""
     async def predicate(ctx):
-        logging.info(f"DEBUG: Command '{ctx.command.name}' issued in channel ID: {ctx.channel.id}")
-        logging.info(f"DEBUG: Allowed channel IDs from config: {ALLOWED_CHANNEL_IDS}")
-        if not ALLOWED_CHANNEL_IDS:
-            logging.info("DEBUG: ALLOWED_CHANNEL_IDS is empty, allowing all channels (no restriction).")
-            return True
-        if ctx.channel.id in ALLOWED_CHANNEL_IDS:
-            logging.info(f"DEBUG: Channel {ctx.channel.id} IS in allowed list. Allowing command.")
+        if not PAINT_CHANNEL_IDS or ctx.channel.id in PAINT_CHANNEL_IDS:
             return True
         else:
-            logging.warning(f"DEBUG: Channel {ctx.channel.id} is NOT in allowed list. Denying command.")
-            await ctx.send(f"Sorry, {ctx.author.mention}, I can only respond to commands in specific channels. Please use one of the designated bot channels.")
+            await ctx.send(f"Sorry, {ctx.author.mention}, you can only use me in paint channels.", ephemeral=True)
             return False
     return commands.check(predicate)
 
-# --- Bot Events ---
+# --- Chat Response Generation ---
+async def generate_chat_response(message, user_message: str):
+    """Generates a chat response using the same logic as the existing chat system."""
+    
+    if 'date' in user_message.lower() or 'time' in user_message.lower():
+        # Timezone detection
+        tz_name = "America/Chicago" # Default timezone
+        for tz_key, tz_value in TIMEZONE_MAP.items():
+            if tz_key in user_message.lower():
+                tz_name = tz_value
+                break
+        
+        try:
+            target_tz = ZoneInfo(tz_name)
+            now = datetime.datetime.now(tz=target_tz)
+            time_str = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
+            # Add the timezone name to the injected prompt for clarity
+            user_message = f"[Current Time in {tz_name.replace('_', ' ')}: {time_str}] {user_message}"
+        except Exception as e:
+            logging.error(f"Could not get timezone-aware time for {tz_name}: {e}")
+            # Fallback for safety
+            now = datetime.datetime.now()
+            time_str = now.strftime("%A, %B %d, %Y at %I:%M %p")
+            user_message = f"[Current Time: {time_str}] {user_message}"
 
-@bot.event
-async def on_ready():
-    """Called when the bot successfully connects to Discord."""
-    print(f'Bot connected as {bot.user}!')
-    print(f'Bot ID: {bot.user.id}')
-    print(f'Using Forge API at: {forge_api.base_url}')
-    print(f'Current default resolution: {current_width}x{current_height} ({current_preset_name})')
-    # 'Upscaling enabled' print statement removed as there's no global Hires.fix state now
-    print('--------------------------')
-    await bot.change_presence(activity=discord.Game(name=f"Generating art with {COMMAND_PREFIX}generate"))
+    channel_id = message.channel.id
+    if channel_id not in chat_histories:
+        chat_histories[channel_id] = []
+    history = chat_histories[channel_id]
 
-@bot.event
-async def on_command_error(ctx, error):
-    """Global error handler for commands."""
-    if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Oops! You're missing an argument. Usage: `{COMMAND_PREFIX}{ctx.command.name} {ctx.command.signature}`")
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send(f"That wasn't quite right. Please check your arguments for `{COMMAND_PREFIX}{ctx.command.name}`.")
-    elif isinstance(error, commands.CommandNotFound):
-        pass
-    elif isinstance(error, commands.CheckFailure):
-        pass
+    # Check for and load user profile
+    user_id = message.author.id
+    profile_path = os.path.join(PROFILE_DIR, f"{user_id}.txt")
+    user_profile_text = ""
+    if os.path.exists(profile_path):
+        try:
+            with open(profile_path, 'r', encoding='utf-8') as f:
+                user_profile_text = f.read().strip()
+        except Exception as e:
+            logging.error(f"Could not read profile for user {user_id}: {e}")
+
+    # Construct the user's turn, including profile if it exists
+    if user_profile_text:
+        user_turn_prompt = f"[User Profile for {message.author.display_name}: [[{user_profile_text}]]] {message.author.display_name}: {user_message}"
     else:
-        print(f"An unhandled error occurred in command {ctx.command}: {error}")
-        await ctx.send(MSG_GEN_ERROR)
+        user_turn_prompt = f"{message.author.display_name}: {user_message}"
 
-# --- Bot Commands ---
+    current_turn_text = f"<start_of_turn>user\n{user_turn_prompt}<end_of_turn>"
+    persona_text = f"You are {CHARACTER_NAME}. {CHARACTER_PERSONA}\n\n"
+    tokens_used = get_token_count(persona_text + current_turn_text)
 
-@bot.command(name="res", help="Sets the image resolution. Choices: portrait, landscape, square.")
-@is_allowed_channel()
-async def set_resolution(ctx, preset: str):
-    """
-    Allows users to set one of the predefined image resolutions.
-    Example: !paint res portrait
-    """
-    global current_width, current_height, current_preset_name
+    history_conversation = []
+    for msg in reversed(history):
+        user_prefix = f"{msg['user_name']}: " if msg['user_name'] != CHARACTER_NAME else ""
+        msg_text = f"<start_of_turn>{'model' if msg['user_name'] == CHARACTER_NAME else 'user'}\n{user_prefix}{msg['text']}<end_of_turn>"
+        msg_tokens = get_token_count(msg_text)
+        if tokens_used + msg_tokens > CONTEXT_TOKEN_LIMIT: break
+        history_conversation.insert(0, msg_text)
+        tokens_used += msg_tokens
 
-    preset = preset.lower()
-    if preset in RESOLUTIONS:
-        current_width = RESOLUTIONS[preset]["width"]
-        current_height = RESOLUTIONS[preset]["height"]
-        current_preset_name = preset
-        await ctx.send(MSG_RES_SET.format(width=current_width, height=current_height, preset=current_preset_name))
+    full_prompt = persona_text + "\n".join(history_conversation) + "\n" + current_turn_text + "\n<start_of_turn>model\n"
+    
+    response_text = await asyncio.to_thread(kobold_api.generate_text, full_prompt)
+
+    if response_text:
+        history.append({"user_name": message.author.display_name, "text": user_message})
+        history.append({"user_name": CHARACTER_NAME, "text": response_text})
+        return response_text
     else:
-        await ctx.send(MSG_INVALID_RES)
-
-# The !upscale command has been removed
-# @bot.command(name="upscale", help="Toggles upscaling (Hires. fix) for generated images.")
-# @is_allowed_channel()
-# async def toggle_upscale(ctx):
-#     """
-#     Toggles Hires. fix (upscaling) on or off.
-#     Note: When enabled, specific upscaling settings from config.py are used.
-#     """
-#     global enable_upscale
-#     enable_upscale = not enable_upscale
-#
-#     if enable_upscale:
-#         await ctx.send(MSG_UPSCALE_ENABLED)
-#     else:
-#         await ctx.send(MSG_UPSCALE_DISABLED)
-
-@bot.command(name="generate", help="Generates an image using Stable Diffusion Forge. When prompting first describe the setting, then naturally describe the picture, and finally add any specific tags separated by commas. adding :: after this allows you to add negative prompts as well.")
-@is_allowed_channel()
-async def generate_image(ctx, *, full_user_prompt: str):
-    """
-    Generates an image based on a positive and optional negative prompt.
-    Usage: !paint generate [user_positive_prompt] [:: optional_user_negative_prompt]
-    Example: !paint generate a cute cat in space :: ugly, blurry
-    """
-    if not full_user_prompt.strip():
-        await ctx.send(MSG_NO_PROMPT)
-        return
-
-    user_positive_part = ""
-    user_negative_part = ""
-
-    if "::" in full_user_prompt:
-        parts = full_user_prompt.split("::", 1)
-        user_positive_part = parts[0].strip()
-        user_negative_part = parts[1].strip()
-    else:
-        user_positive_part = full_user_prompt.strip()
-
-    final_positive_prompt = f"{BASE_POSITIVE_PROMPT}, {user_positive_part}"
-    final_positive_prompt = final_positive_prompt.strip(", ").replace(",,", ",").strip()
-
-    combined_negative_prompt = f"{user_negative_part}, {BASE_NEGATIVE_PROMPT}"
-    combined_negative_prompt = combined_negative_prompt.strip(", ").replace(",,", ",").strip()
-
-    cleaned_final_negative_prompt = clean_negative_prompt(combined_negative_prompt)
-
-    await ctx.send(MSG_GENERATING)
-    logging.info(f"User '{ctx.author}' requested generation.")
-    logging.info(f"Positive (final): '{final_positive_prompt}'")
-    logging.info(f"Negative (final & cleaned): '{cleaned_final_negative_prompt}'")
-    logging.info(f"Resolution: {current_width}x{current_height}")
-    # 'Upscaling enabled' logging removed as Hires.fix is no longer controlled by bot
-    logging.info(f"ADetailer enabled by default: {ADETAILER_ENABLED_BY_DEFAULT}") # Added logging for ADetailer
-
-    # --- Construct the payload for Forge API with ADetailer only ---
-    payload = {
-        "prompt": final_positive_prompt,
-        "negative_prompt": cleaned_final_negative_prompt,
-        "steps": DEFAULT_STEPS,
-        "cfg_scale": DEFAULT_CFG_SCALE,
-        "sampler_name": DEFAULT_SAMPLER_NAME,
-        "seed": DEFAULT_SEED,
-        "width": current_width,
-        "height": current_height,
-        "clip_skip": DEFAULT_CLIP_SKIP,
-        "override_settings": {
-            "sd_model_checkpoint": DEFAULT_MODEL
-        },
-        "alwayson_scripts": {} # Initialize alwayson_scripts dictionary
-    }
-
-    # Hires.fix parameters removed
-
-    # Add ADetailer parameters if enabled (which is controlled by config.py now)
-    if ADETAILER_ENABLED_BY_DEFAULT:
-        payload["alwayson_scripts"]["ADetailer"] = {
-            "args": [
-                { # First ADetailer pass settings
-                    "ad_model": ADETAILER_DETECTION_MODEL,
-                    "ad_prompt": ADETAILER_PROMPT,
-                    "ad_negative_prompt": ADETAILER_NEGATIVE_PROMPT,
-                    "ad_confidence": ADETAILER_CONFIDENCE,
-                    "ad_mask_blur": ADETAILER_MASK_BLUR,
-                    "ad_denoising_strength": ADETAILER_INPAINT_DENOISING,
-                    "ad_inpaint_only_masked": ADETAILER_INPAINT_ONLY_MASKED,
-                    "ad_inpaint_padding": ADETAILER_INPAINT_PADDING,
-
-                    # --- Common ADetailer parameters often required by API, even if defaults ---
-                    "ad_cfg_scale": DEFAULT_CFG_SCALE,
-                    "ad_steps": DEFAULT_STEPS,
-                    "ad_sampler": DEFAULT_SAMPLER_NAME,
-                    "ad_clip_skip": 1, # ADetailer specific clip skip, usually 1
-                    "ad_checkpoint": "", # Changed to empty string ""
-                    "ad_vae": "", # Changed to empty string ""
-                    "ad_use_inpaint_width_height": False,
-                    "ad_inpaint_width": current_width,
-                    "ad_inpaint_height": current_height
-                }
-            ]
-        }
-
-    image = await asyncio.to_thread(forge_api.txt2img, payload)
-
-    if image:
-        with io.BytesIO() as image_binary:
-            image.save(image_binary, 'PNG')
-            image_binary.seek(0)
-            file_name = f"generated_image_{os.urandom(4).hex()}.png"
-            discord_file = discord.File(fp=image_binary, filename=file_name)
-            await ctx.send(f"Here's your image, {ctx.author.mention}!", file=discord_file)
-            logging.info(f"Image sent for '{ctx.author}'.")
-    else:
-        await ctx.send(MSG_GEN_ERROR)
-        logging.error("Failed to get image from Forge API.")
-
-# --- Run the Bot ---
-if __name__ == "__main__":
-    bot.run(DISCORD_TOKEN)
+        return None
+        

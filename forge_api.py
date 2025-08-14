@@ -73,20 +73,19 @@ class ForgeAPIClient:
         response_data = self._send_request("POST", self.txt2img_url, data=payload)
 
         if response_data and "images" in response_data and response_data["images"]:
-            # Forge returns a list of base64 encoded images
-            image_b64 = response_data["images"][0] # Take the first image
+            # Forge returns a list of base64 encoded images and an info string (as json)
+            image_b64 = response_data["images"][0]
+            info_json = response_data.get("info", "{}") # Get info, default to empty json
+            
             try:
                 img_bytes = base64.b64decode(image_b64)
                 image = Image.open(io.BytesIO(img_bytes))
-                return image
+                # Return both the image object and the info json string
+                return image, info_json
             except Exception as e:
                 print(f"Error decoding or opening image: {e}")
-                return None
+                return None, None
         elif response_data:
             print("No 'images' found in the Forge API response.")
-            return None
-        return None
-
-# You could add other API interactions here if needed, e.g., for getting models:
-# def get_models(self):
-#     return self._send_request("GET", f"{self.base_url}/sdapi/v1/sd-models")
+            return None, None
+        return None, None
