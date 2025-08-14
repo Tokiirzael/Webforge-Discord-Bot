@@ -504,10 +504,21 @@ async def on_message(message):
     if message.author == bot.user:
         return
 
+    # 1. Prioritize command processing above all else.
+    if message.content.startswith(COMMAND_PREFIX):
+        await bot.process_commands(message)
+        return
+
+    # 2. If it's not a command, then process it as a potential chat message.
     all_chat_channels = PAINT_CHANNEL_IDS + CHAT_CHANNEL_IDS
     is_allowed_channel = (message.channel.id in all_chat_channels or (message.channel.category and message.channel.category.id in ALLOWED_CATEGORY_IDS))
 
-    if message.attachments and "image" in message.attachments[0].content_type and is_allowed_channel:
+    # Stop processing if the message is not in an allowed channel/category
+    if not is_allowed_channel:
+        return
+
+    # Handle image attachments if present
+    if message.attachments and "image" in message.attachments[0].content_type:
         try:
             await message.add_reaction("🤔")
             image_bytes = await message.attachments[0].read()
@@ -530,11 +541,7 @@ async def on_message(message):
         except Exception as e:
             logging.error(f"Error processing image attachment: {e}")
             await message.channel.send("Sorry, an error occurred while processing the image.")
-        return
-
-    if message.content.startswith(COMMAND_PREFIX):
-        await bot.process_commands(message)
-        return
+        return # Stop further processing after handling the image
 
     command_trigger = "!" + CHARACTER_NAME.lower()
 
@@ -555,17 +562,24 @@ async def on_message(message):
         return
 
     if message.content.lower() == command_trigger:
+        # Activate listen mode when the bot is addressed by name
+        if message.channel.id in listening_channels:
+            listening_channels[message.channel.id].cancel()
+        listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
+
         await message.channel.send(CHARACTER_GREETING)
+        await message.channel.send("*Gemma is now listening in this channel for 30 minutes. Mention her name to chat. Type `!stop` to end listening mode early.*")
         return
 
     is_direct_chat = message.content.lower().startswith(command_trigger + " ")
     is_mention_in_listen_mode = (message.channel.id in listening_channels and CHARACTER_NAME.lower() in message.content.lower())
 
     if (is_direct_chat or is_mention_in_listen_mode) and is_allowed_channel:
-        if is_direct_chat:
-            if message.channel.id in listening_channels:
-                listening_channels[message.channel.id].cancel()
-            listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
+        # If this channel is in listen mode, reset the timer.
+        if message.channel.id in listening_channels:
+            listening_channels[message.channel.id].cancel()
+        # Start a new timer. This also activates listen mode for direct chats.
+        listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
 
         user_message = message.content[len(command_trigger):].strip() if is_direct_chat else message.content
         if not user_message: return

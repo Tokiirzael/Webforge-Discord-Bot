@@ -10,82 +10,65 @@ import sys
 from pathlib import Path
 import subprocess
 
+# Import the configuration from the main config file
+try:
+    from config import KOKORO_LOCAL_PATH, KOKORO_PYTHON_PATH
+except ImportError:
+    print("❌ Could not import from config.py. Make sure it exists and is in the same directory.")
+    sys.exit(1)
+
 def test_kokoro_path():
-    """Test if Kokoro installation can be found."""
+    """Test if Kokoro installation can be found using the path from config.py."""
     print("=" * 50)
-    print("TESTING KOKORO INSTALLATION PATH")
+    print("TESTING KOKORO INSTALLATION PATH (from config.py)")
     print("=" * 50)
     
-    # Check config values (you'll need to update these)
-    kokoro_paths_to_check = [
-        "F:/Kokoro",  # Your likely path based on config
-        "../Kokoro",
-        "./Kokoro",
-        "../Kokoro-TTS-Local",
-        "./Kokoro-TTS-Local",
-    ]
+    # Use the path directly from config.py
+    path = KOKORO_LOCAL_PATH
+    print(f"Checking: {path.resolve()}")
     
-    found_path = None
-    for path_str in kokoro_paths_to_check:
-        path = Path(path_str)
-        print(f"Checking: {path.absolute()}")
-        
-        if path.exists():
-            print(f"  ✅ Path exists")
-            
-            # Check for key files
-            key_files = ["tts_demo.py", "models.py", "gradio_interface.py"]
-            all_files_found = True
-            
-            for file in key_files:
-                file_path = path / file
-                if file_path.exists():
-                    print(f"  ✅ Found {file}")
-                else:
-                    print(f"  ❌ Missing {file}")
-                    all_files_found = False
-            
-            if all_files_found:
-                found_path = path
-                print(f"  🎉 Valid Kokoro installation found!")
-                break
-        else:
-            print(f"  ❌ Path does not exist")
-    
-    if found_path:
-        print(f"\n✅ Kokoro installation found at: {found_path.absolute()}")
-        return found_path
-    else:
+    if not (path.exists() and path.is_dir()):
+        print(f"  ❌ Path does not exist or is not a directory")
         print(f"\n❌ No valid Kokoro installation found!")
-        print("Please make sure Kokoro-TTS-Local is installed and update the paths in config.py")
+        print("Please make sure Kokoro-TTS-Local is installed and the KOKORO_LOCAL_PATH in config.py is correct.")
+        return None
+        
+    print(f"  ✅ Path exists")
+
+    # Check for key files
+    key_files = ["tts_demo.py", "models.py", "gradio_interface.py"]
+    all_files_found = True
+
+    for file in key_files:
+        file_path = path / file
+        if file_path.exists():
+            print(f"  ✅ Found {file}")
+        else:
+            print(f"  ❌ Missing {file}")
+            all_files_found = False
+    
+    if all_files_found:
+        print(f"  🎉 Valid Kokoro installation found!")
+        print(f"\n✅ Kokoro installation found at: {path.resolve()}")
+        return path
+    else:
+        print(f"\n❌ Kokoro installation found, but key files are missing.")
         return None
 
 def test_python_environment(kokoro_path):
-    """Test if Python environment is accessible."""
+    """Test if Python environment is accessible using the path from config.py."""
     print("\n" + "=" * 50)
-    print("TESTING PYTHON ENVIRONMENT")
+    print("TESTING PYTHON ENVIRONMENT (from config.py)")
     print("=" * 50)
     
-    # Check for virtual environment
-    venv_paths = [
-        kokoro_path / "venv" / "Scripts" / "python.exe",  # Windows
-        kokoro_path / "venv" / "bin" / "python",  # Linux/Mac
-    ]
+    python_path = KOKORO_PYTHON_PATH
+    print(f"Checking: {python_path.resolve()}")
     
-    python_path = None
-    for venv_path in venv_paths:
-        print(f"Checking: {venv_path}")
-        if venv_path.exists():
-            print(f"  ✅ Virtual environment Python found")
-            python_path = venv_path
-            break
-        else:
-            print(f"  ❌ Not found")
+    if not python_path.exists():
+        print(f"  ❌ Python executable not found at the path specified in config.py.")
+        return None
     
-    if not python_path:
-        # Try system Python
-        python_path = "python"
-        print(f"  🔄 Falling back to system Python: {python_path}")
+    print(f"  ✅ Python executable found")
     
     # Test Python execution
     try:

@@ -133,9 +133,9 @@ class KokoroTTSClient:
         # Clean up extra whitespace
         text = ' '.join(text.split())
         
-        # Limit length (local TTS can handle longer text)
-        if len(text) > 2000:
-            text = text[:1997] + "..."
+        # Limit length (local TTS can handle longer text) - This is now handled by the text splitting in the bot
+        # if len(text) > 2000:
+        #     text = text[:1997] + "..."
             
         return text.strip()
 
