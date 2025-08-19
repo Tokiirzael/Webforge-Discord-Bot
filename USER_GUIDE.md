@@ -50,22 +50,26 @@ After an image is generated, it will appear with a set of buttons:
 
 ## 2. Chatting with the AI
 
-You can have conversations with the bot's AI persona, "Gemma".
+You can have conversations with the bot's AI persona, "Gemma". Before you can chat, the AI service must be started.
 
-### Activating Chat
+*   `!gemma`
+    *   This command starts the chat AI service. The bot will notify you when it's ready. The service will automatically go dormant after 30 minutes of inactivity.
 
-There are two ways to talk to Gemma:
+### Sending a Prompt
 
-1.  **Direct Command**: Start your message with `!gemma <your message>`. This will activate "listen mode" in the channel for 30 minutes, meaning the bot will respond to subsequent messages that mention its name.
+Once the service is running, there are two ways to talk to Gemma:
+
+1.  **Direct Command**: Start your message with `!gemma <your message>`.
     *   *Example*: `!gemma Hello, how are you today?`
 
-2.  **Listen Mode**: A user can type `!listen` to activate listen mode for 30 minutes. During this time, any message that contains the word "gemma" will trigger a response.
-    *   Typing `!listen` again will reset the timer.
-    *   Typing `!stop` will immediately deactivate listen mode.
+2.  **Casual Mention**: Simply include "Gemma" anywhere in your message.
+    *   *Example*: `Hello Gemma, what can you do?`
+
+Either of these methods will reset the 30-minute inactivity timer.
 
 ### Image Interrogation
 
-If you upload an image and mention Gemma (or use the `!gemma` command with your message), the bot will attempt to describe the image and respond to your message in context.
+If you upload an image and mention Gemma (or use the `!gemma <text>` command), the bot will attempt to describe the image and respond to your message in context.
 
 ---
 
@@ -78,7 +82,7 @@ You can make Gemma's responses audible using Text-to-Speech.
 To have a chat response read aloud, simply include the word **speak** in your message to the bot.
 
 *   *Example*: `!gemma speak Tell me a story.`
-*   *Example (in listen mode)*: `gemma can you speak your reply?`
+*   *Example*: `Gemma can you speak your reply?`
 
 The bot will generate the audio and post it as a `.wav` file in the channel.
 
@@ -99,3 +103,27 @@ You can set a user profile to give Gemma more context about who you are, leading
 
 *   `!paint deleteprofile`
     *   Permanently deletes your user profile.
+
+---
+
+## 5. Service Management
+
+The bot can start and stop the backend AI services for you.
+
+### Image Generation (Forge)
+
+*   `!paint start`
+    *   Starts the Stable Diffusion Forge service. You must run this command before you can generate images.
+*   `!paint stop`
+    *   Stops the Stable Diffusion Forge service. This is useful for freeing up computer resources (like VRAM).
+
+**Note**: The Forge service has an automatic idle timer. If no images are generated for a certain period, it will shut down automatically.
+
+### Chat AI (KoboldCpp)
+
+*   `!gemma`
+    *   Starts the KoboldCpp service for chat. This is required before you can talk to the AI.
+*   `!listen`
+    *   Resets the 30-minute inactivity timer for the chat AI, keeping it active.
+*   `!stop`
+    *   Manually stops the KoboldCpp service and deactivates the inactivity timer.

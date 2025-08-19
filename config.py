@@ -65,9 +65,31 @@ GENERATION_TIERS = [
 FORGE_API_URL = "http://127.0.0.1:7860"
 TXT2IMG_ENDPOINT = "/sdapi/v1/txt2img"
 
+# Path to the launch script for Forge (e.g., "C:/path/to/webui-user.bat")
+# This MUST be set for the bot to be able to start Forge.
+FORGE_LAUNCH_SCRIPT_PATH = "" # <-- IMPORTANT: SET THIS PATH
+
+# Command-line arguments to use when launching Forge.
+# --api is required for the bot to function.
+# To cap VRAM usage, add: "--medvram-sdxl --vram-reservation-level=21910"
+FORGE_LAUNCH_ARGS = ["--api", "--listen", "--enable-insecure-extension-access"]
+
+# How many minutes of inactivity before the bot automatically shuts down Forge.
+# Set to 0 to disable the idle timer.
+FORGE_IDLE_TIMEOUT_MINUTES = 30
+
+
 # --- KoboldCpp API Settings ---
 KOBOLDCPP_API_URL = "http://127.0.0.1:5001" # The base URL for your KoboldCpp instance
 KOBOLDCPP_CHAT_ENDPOINT = "/api/v1/generate" # The endpoint for text generation
+KOBOLDCPP_LAUNCH_SCRIPT_PATH = "" # The path to your koboldcpp.exe
+KOBOLDCPP_PROFILE_PATH = "" # The path to your .kcpps profile file
+KOBOLDCPP_IDLE_TIMEOUT_MINUTES = 30 # How many minutes of inactivity before shutting down KoboldCpp. Set to 0 to disable.
+
+# --- Web Search API Settings ---
+# The name of the environment variable for your SerpApi API key.
+# You need to add this to your .env file.
+SERPAPI_API_KEY_NAME = "SERPAPI_API_KEY"
 
 # --- Kokoro TTS Settings (For PierrunoYT/Kokoro-TTS-Local) ---
 # Path to your Kokoro-TTS-Local installation directory (relative to this config file)
@@ -96,7 +118,7 @@ TTS_TIMEOUT = 120
 # This is the character the bot will roleplay as.
 CHARACTER_NAME = "Gemma"
 # This is the persona that will be used in the prompt to the AI.
-CHARACTER_PERSONA = "A helpful and vaguely flirtatious feminine AI assistant who occasionally jokes or teases the users. Speaks with as if she is an eloquent servant. Does not use any kind of emoji. Cannot see images."
+CHARACTER_PERSONA = "A helpful and vaguely flirtatious feminine AI assistant who occasionally jokes or teases the users. Speaks with as if she is an eloquent servant. Does not use any kind of emoji. Cannot see images. You have the ability to search the web. If you need information you don't have, especially for recent events or specific facts, respond with ONLY the command [SEARCH: \"your search query\"]. Do not add any other text to your response when you use the search command."
 # This is a greeting message the bot can use.
 CHARACTER_GREETING = "Hello! You require my attention? Lovely thing."
 

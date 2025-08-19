@@ -5,23 +5,29 @@ This is a multi-purpose Discord bot that integrates with several local AI backen
 ## Core Features
 
 *   **AI Image Generation**: Generate high-quality images using a local Stable Diffusion Forge instance. Supports different aspect ratios, upscaling, custom seeds, and negative prompts.
-*   **AI Chat**: Engage in conversation with an AI persona (`Gemma`). The bot supports listen-only mode, direct mentions, and remembers conversation history per channel. It can also describe images that are uploaded to the chat.
+*   **AI Chat**: Engage in conversation with an AI persona (`Gemma`). The bot can be triggered by direct command or by mentioning its name.
 *   **Text-to-Speech (TTS)**: Bring the AI's responses to life! When requested, the bot will generate audio for its chat responses using a local Kokoro-TTS installation.
-*   **User Profiles**: Users can set a personal profile that provides additional context to the AI during conversations, allowing for more personalized interactions.
+*   **User Profiles**: Users can set a personal profile that provides additional context to the AI during conversations.
+*   **Automatic Service Management**: The bot can start and stop the Forge and KoboldCpp backends directly from Discord, and includes idle-timers to automatically shut them down when not in use.
+*   **Web Search**: The AI can perform web searches to answer questions about recent events or specific topics it doesn't have in its knowledge base.
 
 ## Setup & Installation
 
 1.  **Prerequisites**:
     *   Python 3.10+
-    *   A running instance of [Stable Diffusion Forge](https://github.com/lllyasviel/stable-diffusion-webui-forge) with the `--api` flag enabled.
-    *   A running instance of [KoboldCpp](https://github.com/LostRuins/koboldcpp) for chat and image interrogation.
+    *   A local installation of [Stable Diffusion Forge](https://github.com/lllyasviel/stable-diffusion-webui-forge).
+    *   A local installation of [KoboldCpp](https://github.com/LostRuins/koboldcpp).
     *   A local installation of [Kokoro-TTS-Local](https://github.com/PierrunoYT/Kokoro-TTS-Local).
 
 2.  **Configuration**:
     *   Clone this repository.
     *   Place your `Kokoro-TTS-Local` installation into a subdirectory of the same name within this project.
-    *   Create a `.env` file in the root directory and add your Discord bot token: `DISCORD_TOKEN=YOUR_BOT_TOKEN_HERE`.
-    *   Review `config.py` and update the API URLs, channel/role IDs, and other settings to match your environment.
+    *   Create a `.env` file in the root directory and add your Discord bot token and SerpApi key:
+        ```
+        DISCORD_TOKEN=YOUR_BOT_TOKEN_HERE
+        SERPAPI_API_KEY=YOUR_SERPAPI_KEY_HERE
+        ```
+    *   Review `config.py` and update all settings, especially the launch paths for Forge and KoboldCpp, to match your environment.
 
 3.  **Installation**:
     ```bash

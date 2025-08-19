@@ -15,6 +15,9 @@ import datetime
 from zoneinfo import ZoneInfo
 import base64
 
+import re
+from web_search import perform_search, scrape_website_text
+
 # Import settings from the config file
 from config import (
     DISCORD_TOKEN_NAME, COMMAND_PREFIX, PAINT_CHANNEL_IDS, CHAT_CHANNEL_IDS, ALLOWED_CATEGORY_IDS,
@@ -30,12 +33,17 @@ from config import (
     HIRES_RESIZE_WIDTH, HIRES_RESIZE_HEIGHT,
     MSG_GENERATING, MSG_GEN_ERROR, MSG_NO_PROMPT, MSG_API_ERROR,
     KOBOLDCPP_API_URL, CHARACTER_NAME, CHARACTER_PERSONA, CONTEXT_TOKEN_LIMIT, CHARACTER_GREETING, TIMEZONE_MAP,
+    KOBOLDCPP_IDLE_TIMEOUT_MINUTES,
     # TTS Settings
-    MAX_CONCURRENT_TTS, TTS_TIMEOUT, MSG_TTS_GENERATING, MSG_TTS_ERROR, MSG_TTS_QUEUE_FULL
+    MAX_CONCURRENT_TTS, TTS_TIMEOUT, MSG_TTS_GENERATING, MSG_TTS_ERROR, MSG_TTS_QUEUE_FULL,
+    # New Forge settings
+    FORGE_IDLE_TIMEOUT_MINUTES
 )
 from forge_api import ForgeAPIClient
 from kobold_api import KoboldAPIClient
 from kokoro_api import KokoroTTSClient
+import process_manager
+import kobold_process_manager
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s:%(levelname)s:%(name)s: %(message)s')
@@ -54,7 +62,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 forge_api = ForgeAPIClient()
 kobold_api = KoboldAPIClient(base_url=KOBOLDCPP_API_URL)
 kokoro_api = KokoroTTSClient()
@@ -62,6 +70,10 @@ kokoro_api = KokoroTTSClient()
 user_stats = {} # In-memory cache for user generation stats
 chat_histories = {} # key: channel_id, value: list of messages
 listening_channels = {} # {channel_id: asyncio.Task}
+last_forge_use_time = None
+forge_idle_task = None
+last_kobold_use_time = None
+kobold_idle_task = None
 
 # --- TTS Queue System ---
 tts_queue = asyncio.Queue()
@@ -236,6 +248,74 @@ def is_allowed_paint_channel():
             return False
     return commands.check(predicate)
 
+# --- Agentic Web Search Logic ---
+
+async def _get_final_answer_from_search(original_prompt: str, scraped_content: str, source_url: str):
+    """Formats a prompt with search context and calls the AI, asking it to cite its source."""
+    # We need to make sure we don't exceed the token limit. Let's reserve half the context for scraped text.
+    max_context_len = CONTEXT_TOKEN_LIMIT // 2
+    truncated_text = scraped_content[:max_context_len]
+
+    # Construct a new persona/prompt for the summarization and citation task
+    new_prompt = (
+        f"You are a helpful research assistant. A user asked a question, and you performed a web search. "
+        f"Now, based on the provided text from the webpage, answer the user's original question. "
+        f"At the end of your answer, you MUST cite your source in the format: \"Source: [URL]\"\n\n"
+        f"User's question: \"{original_prompt}\"\n\n"
+        f"Source URL: {source_url}\n\n"
+        f"Webpage Content:\n---\n{truncated_text}\n---\n\n"
+        f"Answer:"
+    )
+
+    # Use the existing kobold_api client to generate the text
+    final_answer = await asyncio.to_thread(kobold_api.generate_text, new_prompt)
+    return final_answer
+
+async def handle_agentic_search(response_text: str, original_prompt: str, ctx: commands.Context):
+    """
+    Checks for a [SEARCH: "query"] command in the AI's response.
+    If found, performs the search, gets new context, and calls the AI again to get a final answer.
+    Returns a tuple of (final_message, search_performed_bool).
+    """
+    SEARCH_COMMAND_PATTERN = r'\[SEARCH: "([^"]+)"\]'
+    match = re.search(SEARCH_COMMAND_PATTERN, response_text)
+
+    if not match:
+        return response_text, False  # No search command, return original response
+
+    query = match.group(1)
+    logging.info(f"AI requested a web search for: '{query}'")
+    try:
+        await ctx.channel.send(f"🧠 Searching the web for `{query}`...")
+    except discord.errors.NotFound:
+        # This can happen if the original message was deleted.
+        logging.warning("Could not send search status message; original context not found.")
+
+
+    # 1. Perform Search
+    search_results = perform_search(query)
+    if not search_results:
+        return "I tried to search the web, but my search came up empty.", True
+
+    # 2. Scrape Top Result
+    top_result_url = search_results[0].get('link')
+    if not top_result_url:
+        return "I found search results, but I couldn't extract a valid link.", True
+
+    logging.info(f"Scraping content from URL: {top_result_url}")
+    scraped_content = scrape_website_text(top_result_url)
+    if not scraped_content:
+        return f"I found a webpage ({top_result_url}), but I was unable to read its content.", True
+
+    # 3. Get Final Answer
+    logging.info("Getting summarized answer from AI based on scraped content.")
+    final_answer = await _get_final_answer_from_search(original_prompt, scraped_content, top_result_url)
+
+    if not final_answer:
+        return "I found information on the web, but I had trouble summarizing it.", True
+
+    return final_answer, True
+
 # --- UI Components ---
 
 class GenerationView(discord.ui.View):
@@ -315,6 +395,11 @@ class GenerationView(discord.ui.View):
 
 async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, seed: int = None):
     """Prepares the payload and calls the Forge API to generate an image."""
+    # First, check if the Forge API is online
+    if not forge_api.is_online():
+        await ctx.send(f"Sorry, the image generation service appears to be offline. Please use the `{COMMAND_PREFIX}start` command to start it.")
+        return
+
     if not prompt:
         await ctx.send(MSG_NO_PROMPT)
         return
@@ -360,6 +445,9 @@ async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, see
     image, info_json = await asyncio.to_thread(forge_api.txt2img, payload)
 
     if image and info_json:
+        global last_forge_use_time
+        last_forge_use_time = datetime.datetime.now()
+
         # --- Stat Tracking ---
         user_id_str = str(ctx.author.id)
         user_stats[user_id_str] = user_stats.get(user_id_str, 0) + 1
@@ -408,11 +496,12 @@ async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, see
 # --- Chat Response Generation ---
 async def generate_chat_response(message, user_message: str):
     """Generates a chat response using the same logic as the existing chat system."""
+    global last_kobold_use_time
+    last_kobold_use_time = datetime.datetime.now()
     
     if 'date' in user_message.lower() or 'time' in user_message.lower():
         # Timezone detection
         tz_name = "America/Chicago" # Default timezone
-        # Use regex to find whole-word matches for timezone keys
         import re
         for tz_key, tz_value in TIMEZONE_MAP.items():
             # \b ensures we match whole words only
@@ -481,15 +570,69 @@ async def generate_chat_response(message, user_message: str):
 
 # --- Bot Events ---
 
+async def forge_idle_check():
+    """A background task to automatically shut down Forge after a period of inactivity."""
+    await bot.wait_until_ready()
+
+    status_channel = None
+    # A channel to post status messages to. Let's try to find a valid one.
+    if PAINT_CHANNEL_IDS:
+        try:
+            status_channel = await bot.fetch_channel(PAINT_CHANNEL_IDS[0])
+        except (discord.NotFound, discord.Forbidden):
+            print(f"Could not fetch status channel {PAINT_CHANNEL_IDS[0]}. Idle shutdown messages will not be sent.")
+
+    while not bot.is_closed():
+        await asyncio.sleep(60) # Check every minute
+
+        if process_manager.is_forge_running() and last_forge_use_time is not None:
+            # Check if timeout is enabled in config
+            if FORGE_IDLE_TIMEOUT_MINUTES > 0:
+                idle_duration = datetime.datetime.now() - last_forge_use_time
+                if idle_duration.total_seconds() > FORGE_IDLE_TIMEOUT_MINUTES * 60:
+                    print(f"Forge has been idle for over {FORGE_IDLE_TIMEOUT_MINUTES} minutes. Shutting down.")
+                    if status_channel:
+                        await status_channel.send(f"Forge has been idle for {FORGE_IDLE_TIMEOUT_MINUTES} minutes. Shutting down to save resources. Use `!paint start` to restart it.")
+                    process_manager.stop_forge()
+
+async def kobold_idle_check():
+    """A background task to automatically shut down KoboldCpp after a period of inactivity."""
+    await bot.wait_until_ready()
+
+    status_channel = None
+    if CHAT_CHANNEL_IDS:
+        try:
+            status_channel = await bot.fetch_channel(CHAT_CHANNEL_IDS[0])
+        except (discord.NotFound, discord.Forbidden):
+            print(f"Could not fetch status channel {CHAT_CHANNEL_IDS[0]}. Idle shutdown messages will not be sent.")
+
+    while not bot.is_closed():
+        await asyncio.sleep(60) # Check every minute
+
+        if kobold_process_manager.is_koboldcpp_running() and last_kobold_use_time is not None:
+            if KOBOLDCPP_IDLE_TIMEOUT_MINUTES > 0:
+                idle_duration = datetime.datetime.now() - last_kobold_use_time
+                if idle_duration.total_seconds() > KOBOLDCPP_IDLE_TIMEOUT_MINUTES * 60:
+                    print(f"KoboldCpp has been idle for over {KOBOLDCPP_IDLE_TIMEOUT_MINUTES} minutes. Shutting down.")
+                    if status_channel:
+                        await status_channel.send(f"The chat AI has been idle for {KOBOLDCPP_IDLE_TIMEOUT_MINUTES} minutes and is going dormant. Use `!gemma` to wake it up.")
+                    kobold_process_manager.stop_koboldcpp()
+
 @bot.event
 async def on_ready():
     """Called when the bot successfully connects to Discord."""
-    global user_stats
+    global user_stats, forge_idle_task, kobold_idle_task
     user_stats = load_stats()
     logging.info(f'Logged in as {bot.user}')
     if not tts_processing:
         bot.loop.create_task(process_tts_queue())
         logging.info("TTS queue processor started.")
+    if forge_idle_task is None:
+        forge_idle_task = bot.loop.create_task(forge_idle_check())
+        logging.info("Forge idle check task started.")
+    if kobold_idle_task is None:
+        kobold_idle_task = bot.loop.create_task(kobold_idle_check())
+        logging.info("KoboldCpp idle check task started.")
     await bot.change_presence(activity=discord.Game(name=f"Art & Chat"))
 
 @bot.event
@@ -505,7 +648,8 @@ async def on_message(message):
         return
 
     # 1. Prioritize command processing above all else.
-    if message.content.startswith(COMMAND_PREFIX):
+    # This will handle all commands decorated with @bot.command()
+    if message.content.startswith(bot.command_prefix):
         await bot.process_commands(message)
         return
 
@@ -513,91 +657,82 @@ async def on_message(message):
     all_chat_channels = PAINT_CHANNEL_IDS + CHAT_CHANNEL_IDS
     is_allowed_channel = (message.channel.id in all_chat_channels or (message.channel.category and message.channel.category.id in ALLOWED_CATEGORY_IDS))
 
-    # Stop processing if the message is not in an allowed channel/category
     if not is_allowed_channel:
         return
 
-    # Handle image attachments if present
+    # Handle image attachments with chat
     if message.attachments and "image" in message.attachments[0].content_type:
-        try:
-            await message.add_reaction("🤔")
-            image_bytes = await message.attachments[0].read()
-            base64_image = base64.b64encode(image_bytes).decode('utf-8')
-            caption = await asyncio.to_thread(kobold_api.interrogate_image, base64_image=base64_image)
-            await message.remove_reaction("🤔", bot.user)
-            if not caption:
-                await message.channel.send("Sorry, I couldn't interpret that image.")
+        # Let image analysis trigger a chat response, same as a name mention
+        pass # Fall through to the chat logic below
+
+    # Chat Triggers
+    gemma_command_prefix = f"!{CHARACTER_NAME.lower()} "
+    is_direct_chat_command = message.content.lower().startswith(gemma_command_prefix)
+    is_mention = CHARACTER_NAME.lower() in message.content.lower()
+
+    # If the message is a chat trigger (and not a different command)
+    if not message.content.startswith("!") or is_direct_chat_command:
+        if is_direct_chat_command or is_mention:
+            # First, check if the Kobold API is online
+            if not kobold_api.is_online():
+                await message.channel.send(f"Sorry, the chat service is offline. Please use `!gemma` to start it.")
                 return
-            user_context = message.content or "What's in this image?"
-            image_prompt = f"{message.author.display_name} sent you a picture. {user_context}\n\n[Image Content: {caption}]"
-            response_text = await generate_chat_response(message, image_prompt)
-            if response_text:
-                await message.channel.send(response_text)
-                # Only generate speech if the user's original message contained "speak"
-                if "speak" in message.content.lower():
-                    await add_to_tts_queue(message, response_text)
+
+            user_message = ""
+            if is_direct_chat_command:
+                user_message = message.content[len(gemma_command_prefix):].strip()
+            else: # Is a mention
+                user_message = message.content
+
+            if not user_message and not message.attachments:
+                return
+
+            # Handle image analysis if an image is attached
+            if message.attachments and "image" in message.attachments[0].content_type:
+                try:
+                    await message.add_reaction("🤔")
+                    image_bytes = await message.attachments[0].read()
+                    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+                    caption = await asyncio.to_thread(kobold_api.interrogate_image, base64_image=base64_image)
+                    await message.remove_reaction("🤔", bot.user)
+                    if not caption:
+                        await message.channel.send("Sorry, I couldn't interpret that image.")
+                        return
+
+                    user_context = user_message or "What's in this image?"
+                    # Prepend the image context to the user's message
+                    user_message = f"{user_context}\n\n[Image Content: {caption}]"
+
+                except Exception as e:
+                    logging.error(f"Error processing image attachment: {e}")
+                    await message.channel.send("Sorry, an error occurred while processing the image.")
+                    return
+
+            # We have a valid prompt, now get the response
+            initial_response = await generate_chat_response(message, user_message)
+
+            if initial_response:
+                # Pass the initial response to the agentic search handler
+                final_response, search_performed = await handle_agentic_search(initial_response, user_message, message)
+
+                if final_response:
+                    if len(final_response) <= 2000:
+                        await message.channel.send(final_response)
+                    else:
+                        # Handle long messages
+                        for i in range(0, len(final_response), 1990):
+                            await message.channel.send(final_response[i:i + 1990])
+                            await asyncio.sleep(1)
+
+                    # Only generate speech if the user's original message contained "speak"
+                    if "speak" in user_message.lower():
+                        await add_to_tts_queue(message, final_response)
+                else:
+                    await message.channel.send("Sorry, I couldn't get a response from the character, even after a web search.")
+
             else:
-                await message.channel.send("Sorry, I was able to see the image, but I couldn't think of a response.")
-        except Exception as e:
-            logging.error(f"Error processing image attachment: {e}")
-            await message.channel.send("Sorry, an error occurred while processing the image.")
-        return # Stop further processing after handling the image
-
-    command_trigger = "!" + CHARACTER_NAME.lower()
-
-    if message.content.lower() == '!stop':
-        if message.channel.id in listening_channels:
-            task = listening_channels.pop(message.channel.id)
-            task.cancel()
-            if message.channel.id in chat_histories:
-                del chat_histories[message.channel.id]
-            await message.channel.send("**Listen mode has been manually deactivated. Chat history for this session has been cleared.**")
-        return
-
-    if message.content.lower() == '!listen':
-        if message.channel.id in listening_channels:
-            listening_channels[message.channel.id].cancel()
-        listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
-        await message.channel.send("Listen mode timer has been reset for another 30 minutes.")
-        return
-
-    if message.content.lower() == command_trigger:
-        # Activate listen mode when the bot is addressed by name
-        if message.channel.id in listening_channels:
-            listening_channels[message.channel.id].cancel()
-        listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
-
-        await message.channel.send(CHARACTER_GREETING)
-        await message.channel.send("*Gemma is now listening in this channel for 30 minutes. Mention her name to chat. Type `!stop` to end listening mode early.*")
-        return
-
-    is_direct_chat = message.content.lower().startswith(command_trigger + " ")
-    is_mention_in_listen_mode = (message.channel.id in listening_channels and CHARACTER_NAME.lower() in message.content.lower())
-
-    if (is_direct_chat or is_mention_in_listen_mode) and is_allowed_channel:
-        # If this channel is in listen mode, reset the timer.
-        if message.channel.id in listening_channels:
-            listening_channels[message.channel.id].cancel()
-        # Start a new timer. This also activates listen mode for direct chats.
-        listening_channels[message.channel.id] = bot.loop.create_task(listening_timer(message.channel))
-
-        user_message = message.content[len(command_trigger):].strip() if is_direct_chat else message.content
-        if not user_message: return
-
-        response_text = await generate_chat_response(message, user_message)
-        if response_text:
-            if len(response_text) <= 2000:
-                await message.channel.send(response_text)
-            else:
-                for i in range(0, len(response_text), 1990):
-                    await message.channel.send(response_text[i:i + 1990])
-                    await asyncio.sleep(1)
-            # Only generate speech if the user's original message contained "speak"
-            if "speak" in user_message.lower():
-                await add_to_tts_queue(message, response_text)
-        else:
-            await message.channel.send("Sorry, I couldn't get a response from the character.")
-        return
+                await message.channel.send("Sorry, I couldn't get a response from the character.")
+            return
 
 @bot.event
 async def on_command_error(ctx, error):
@@ -611,23 +746,43 @@ async def on_command_error(ctx, error):
 
 # --- Bot Commands ---
 
-@bot.command(name="generate", aliases=["generateport", "generateland"], help="Generates an image. Aliases: generateport, generateland.")
+@bot.group(name="paint", invoke_without_command=True)
+async def paint(ctx):
+    """Base command for all paint-related commands."""
+    await ctx.send_help(ctx.command)
+
+@paint.command(name="generate", aliases=["generateport", "generateland"], help="Generates an image. Aliases: generateport, generateland.")
 @is_allowed_paint_channel()
 async def generate(ctx, *, full_prompt_string: str):
+    """
+    The main command for generating images. It supports different presets based on the alias used
+    and can parse arguments like --upscale and --seed from the prompt string.
+    """
     try:
+        # Separate the command-line style args from the actual prompt text
         args, cleaned_prompt = parse_generate_args(full_prompt_string)
     except ValueError as e:
         await ctx.send(f"Error parsing arguments: {e}. Please check your command format.")
         return
+
+    # Determine which resolution preset to use based on the command alias (e.g., !paint generateland)
     invoked_command = ctx.invoked_with.lower()
-    preset_name = "square"
+    preset_name = "square" # Default
     if invoked_command == "generateport":
         preset_name = "portrait"
     elif invoked_command == "generateland":
         preset_name = "landscape"
-    await _generate_image(ctx, prompt=cleaned_prompt, preset_name=preset_name, upscale=args.get('upscale', False), seed=args.get('seed'))
 
-@bot.command(name="clearchat", help="Clears the chat history for this channel.")
+    # Call the main image generation logic
+    await _generate_image(
+        ctx,
+        prompt=cleaned_prompt,
+        preset_name=preset_name,
+        upscale=args.get('upscale', False), # Use upscale if the arg was found
+        seed=args.get('seed') # Use the specified seed, or None if not found
+    )
+
+@paint.command(name="clearchat", help="Clears the chat history for this channel.")
 async def clearchat(ctx):
     channel_id = ctx.channel.id
     if channel_id in chat_histories:
@@ -636,7 +791,7 @@ async def clearchat(ctx):
     else:
         await ctx.send("There is no chat history for this channel to clear.")
 
-@bot.command(name="setprofile", help="Sets your user profile for the chatbot.")
+@paint.command(name="setprofile", help="Sets your user profile for the chatbot.")
 async def setprofile(ctx, *, profile_text: str):
     """Saves or updates a user's profile text."""
     if not profile_text:
@@ -654,7 +809,7 @@ async def setprofile(ctx, *, profile_text: str):
         logging.error(f"Failed to save profile for user {ctx.author.id}: {e}")
         await ctx.send("Sorry, there was an error saving your profile.")
 
-@bot.command(name="viewprofile", help="View your current user profile.")
+@paint.command(name="viewprofile", help="View your current user profile.")
 async def viewprofile(ctx):
     """Displays the user's current profile to them privately."""
     try:
@@ -668,6 +823,67 @@ async def viewprofile(ctx):
     except Exception as e:
         logging.error(f"Failed to view profile for user {ctx.author.id}: {e}")
         await ctx.send("Sorry, there was an error retrieving your profile.", ephemeral=True)
+
+@bot.command(name="gemma", help="Starts the KoboldCPP service.")
+async def gemma(ctx):
+    """Starts the KoboldCpp service and the idle timer."""
+    global last_kobold_use_time, kobold_idle_task
+    if kobold_process_manager.is_koboldcpp_running():
+        if kobold_api.is_online():
+            await ctx.send("The KoboldCPP service is already running.")
+        else:
+            await ctx.send("The KoboldCPP service is starting, but not yet online. Please wait a moment.")
+        return
+
+    await ctx.send("🚀 Starting the KoboldCPP service... This may take a few minutes.")
+
+    success = await asyncio.to_thread(kobold_process_manager.start_koboldcpp)
+    if not success:
+        await ctx.send("❌ Failed to start the KoboldCPP service. Please check the bot's console for errors.")
+        return
+
+    # Now, wait for the API to become online
+    await ctx.send("...KoboldCPP process started. Waiting for the API to become responsive...")
+
+    online = False
+    for i in range(24): # Wait up to 2 minutes
+        await asyncio.sleep(5)
+        if kobold_api.is_online():
+            online = True
+            break
+
+    if online:
+        last_kobold_use_time = datetime.datetime.now()
+        # Start the idle check task if it's not already running
+        if kobold_idle_task is None or kobold_idle_task.done():
+            kobold_idle_task = bot.loop.create_task(kobold_idle_check())
+            logging.info("KoboldCpp idle check task started.")
+        await ctx.send(f"✅ The KoboldCPP service is now online and ready to use! It will go dormant after {KOBOLDCPP_IDLE_TIMEOUT_MINUTES} minutes of inactivity.")
+    else:
+        await ctx.send("⚠️ The KoboldCPP service started but did not become responsive in time. It might be stuck or still loading.")
+
+@bot.command(name="listen", help="Resets the 30-minute inactivity timer for the chat AI.")
+async def listen(ctx):
+    """Resets the inactivity timer for KoboldCpp."""
+    global last_kobold_use_time
+    if kobold_process_manager.is_koboldcpp_running():
+        last_kobold_use_time = datetime.datetime.now()
+        await ctx.send("✅ Chat AI inactivity timer has been reset for another 30 minutes.")
+    else:
+        await ctx.send("The chat AI is not currently running. Use `!gemma` to start it.")
+
+@bot.command(name="stop", help="Manually stops the KoboldCpp service.")
+async def stop(ctx):
+    """Manually stops the KoboldCpp service and the idle timer."""
+    global kobold_idle_task
+    if kobold_process_manager.is_koboldcpp_running():
+        await ctx.send("🛑 Stopping the KoboldCPP service...")
+        await asyncio.to_thread(kobold_process_manager.stop_koboldcpp)
+        if kobold_idle_task and not kobold_idle_task.done():
+            kobold_idle_task.cancel()
+        await ctx.send("✅ The KoboldCPP service has been stopped.")
+    else:
+        await ctx.send("The KoboldCPP service is not currently running.")
 
 @bot.command(name="deleteprofile", help="Deletes your user profile.")
 async def deleteprofile(ctx):
@@ -683,6 +899,47 @@ async def deleteprofile(ctx):
     except Exception as e:
         logging.error(f"Failed to delete profile for user {ctx.author.id}: {e}")
         await ctx.send("Sorry, there was an error deleting your profile.")
+
+# --- Service Management Commands ---
+@paint.command(name="start", help="Starts the Forge backend service.")
+async def start_service(ctx):
+    if process_manager.is_forge_running():
+        await ctx.send("The Forge service is already running.")
+        return
+
+    await ctx.send("🚀 Starting the Forge service... This may take a few minutes.")
+
+    success = await asyncio.to_thread(process_manager.start_forge)
+    if not success:
+        await ctx.send("❌ Failed to start the Forge service. Please check the bot's console for errors.")
+        return
+
+    # Now, wait for the API to become online
+    await ctx.send("...Forge process started. Waiting for the API to become responsive...")
+
+    online = False
+    for i in range(24): # Wait up to 2 minutes (24 * 5 seconds)
+        await asyncio.sleep(5)
+        if forge_api.is_online():
+            online = True
+            break
+
+    if online:
+        await ctx.send("✅ The Forge service is now online and ready to use!")
+    else:
+        await ctx.send("⚠️ The Forge service started but did not become responsive in time. It might be stuck or still loading.")
+
+
+@paint.command(name="stop", help="Stops the Forge backend service.")
+async def stop_service(ctx):
+    if not process_manager.is_forge_running():
+        await ctx.send("The Forge service is not currently running.")
+        return
+
+    await ctx.send("🛑 Stopping the Forge service...")
+    await asyncio.to_thread(process_manager.stop_forge)
+    await ctx.send("✅ The Forge service has been stopped.")
+
 
 # --- Run the Bot ---
 if __name__ == "__main__":
