@@ -250,71 +250,33 @@ def is_allowed_paint_channel():
 
 # --- Agentic Web Search Logic ---
 
-async def _get_final_answer_from_search(original_prompt: str, scraped_content: str, source_url: str):
-    """Formats a prompt with search context and calls the AI, asking it to cite its source."""
+async def summarize_and_answer_with_persona(original_prompt: str, scraped_content: str, source_url: str):
+    """
+    Formats a prompt that instructs the AI to act as its persona while answering a question
+    based on scraped web content, and to cite its source.
+    """
     # We need to make sure we don't exceed the token limit. Let's reserve half the context for scraped text.
     max_context_len = CONTEXT_TOKEN_LIMIT // 2
     truncated_text = scraped_content[:max_context_len]
 
-    # Construct a new persona/prompt for the summarization and citation task
+    # Construct the new prompt, incorporating the character's persona
     new_prompt = (
-        f"You are a helpful research assistant. A user asked a question, and you performed a web search. "
-        f"Now, based on the provided text from the webpage, answer the user's original question. "
-        f"At the end of your answer, you MUST cite your source in the format: \"Source: [URL]\"\n\n"
-        f"User's question: \"{original_prompt}\"\n\n"
+        f"You are {CHARACTER_NAME}. {CHARACTER_PERSONA}\n\n"
+        f"A user has asked you a question, and you have gathered information from a webpage to answer it. "
+        f"Your task is to synthesize the information from the 'Webpage Content' section and use it to answer the 'User's original question' in your own words, while staying in character. "
+        f"At the end of your response, you MUST cite your source in the format: \"Source: [URL]\"\n\n"
+        f"---\n"
+        f"User's original question: \"{original_prompt}\"\n\n"
         f"Source URL: {source_url}\n\n"
-        f"Webpage Content:\n---\n{truncated_text}\n---\n\n"
-        f"Answer:"
+        f"Webpage Content:\n{truncated_text}\n"
+        f"---\n\n"
+        f"Now, provide your answer:"
     )
 
     # Use the existing kobold_api client to generate the text
     final_answer = await asyncio.to_thread(kobold_api.generate_text, new_prompt)
     return final_answer
 
-async def handle_agentic_search(response_text: str, original_prompt: str, ctx: commands.Context):
-    """
-    Checks for a [SEARCH: "query"] command in the AI's response.
-    If found, performs the search, gets new context, and calls the AI again to get a final answer.
-    Returns a tuple of (final_message, search_performed_bool).
-    """
-    SEARCH_COMMAND_PATTERN = r'\[SEARCH: "([^"]+)"\]'
-    match = re.search(SEARCH_COMMAND_PATTERN, response_text)
-
-    if not match:
-        return response_text, False  # No search command, return original response
-
-    query = match.group(1)
-    logging.info(f"AI requested a web search for: '{query}'")
-    try:
-        await ctx.channel.send(f"🧠 Searching the web for `{query}`...")
-    except discord.errors.NotFound:
-        # This can happen if the original message was deleted.
-        logging.warning("Could not send search status message; original context not found.")
-
-
-    # 1. Perform Search
-    search_results = perform_search(query)
-    if not search_results:
-        return "I tried to search the web, but my search came up empty.", True
-
-    # 2. Scrape Top Result
-    top_result_url = search_results[0].get('link')
-    if not top_result_url:
-        return "I found search results, but I couldn't extract a valid link.", True
-
-    logging.info(f"Scraping content from URL: {top_result_url}")
-    scraped_content = scrape_website_text(top_result_url)
-    if not scraped_content:
-        return f"I found a webpage ({top_result_url}), but I was unable to read its content.", True
-
-    # 3. Get Final Answer
-    logging.info("Getting summarized answer from AI based on scraped content.")
-    final_answer = await _get_final_answer_from_search(original_prompt, scraped_content, top_result_url)
-
-    if not final_answer:
-        return "I found information on the web, but I had trouble summarizing it.", True
-
-    return final_answer, True
 
 # --- UI Components ---
 
@@ -617,6 +579,8 @@ async def kobold_idle_check():
                     if status_channel:
                         await status_channel.send(f"The chat AI has been idle for {KOBOLDCPP_IDLE_TIMEOUT_MINUTES} minutes and is going dormant. Use `!gemma` to wake it up.")
                     kobold_process_manager.stop_koboldcpp()
+                    chat_histories.clear()
+                    logging.info("Chat history has been cleared due to inactivity.")
 
 @bot.event
 async def on_ready():
@@ -708,30 +672,64 @@ async def on_message(message):
                     await message.channel.send("Sorry, an error occurred while processing the image.")
                     return
 
-            # We have a valid prompt, now get the response
-            initial_response = await generate_chat_response(message, user_message)
+            # Check for the new search trigger
+            if CHARACTER_NAME.lower() in user_message.lower() and "search" in user_message.lower():
+                # Extract a clean search query
+                query = re.sub(f'{CHARACTER_NAME.lower()}|search', '', user_message, flags=re.IGNORECASE).strip()
+                logging.info(f"User requested a web search for: '{query}'")
+                await message.channel.send(f"🧠 Searching the web for `{query}`...")
 
-            if initial_response:
-                # Pass the initial response to the agentic search handler
-                final_response, search_performed = await handle_agentic_search(initial_response, user_message, message)
+                # Perform Search
+                search_results = perform_search(query)
+                if not search_results:
+                    await message.channel.send("I tried to search the web, but my search came up empty.")
+                    return
 
-                if final_response:
-                    if len(final_response) <= 2000:
-                        await message.channel.send(final_response)
+                # Scrape Top Result
+                top_result_url = search_results[0].get('link')
+                if not top_result_url:
+                    await message.channel.send("I found search results, but I couldn't extract a valid link.")
+                    return
+
+                logging.info(f"Scraping content from URL: {top_result_url}")
+                scraped_content = scrape_website_text(top_result_url)
+                if not scraped_content:
+                    await message.channel.send(f"I found a webpage ({top_result_url}), but I was unable to read its content.")
+                    return
+
+                # 4. Get Final Answer
+                logging.info("Getting summarized answer from AI based on scraped content.")
+                final_answer = await summarize_and_answer_with_persona(query, scraped_content, top_result_url)
+
+                if final_answer:
+                    if len(final_answer) <= 2000:
+                        await message.channel.send(final_answer)
                     else:
                         # Handle long messages
-                        for i in range(0, len(final_response), 1990):
-                            await message.channel.send(final_response[i:i + 1990])
+                        for i in range(0, len(final_answer), 1990):
+                            await message.channel.send(final_answer[i:i + 1990])
+                            await asyncio.sleep(1)
+                else:
+                    await message.channel.send("I found information on the web, but I had trouble summarizing it.")
+
+            else:
+                # We have a valid prompt, now get the response
+                initial_response = await generate_chat_response(message, user_message)
+
+                if initial_response:
+                    if len(initial_response) <= 2000:
+                        await message.channel.send(initial_response)
+                    else:
+                        # Handle long messages
+                        for i in range(0, len(initial_response), 1990):
+                            await message.channel.send(initial_response[i:i + 1990])
                             await asyncio.sleep(1)
 
                     # Only generate speech if the user's original message contained "speak"
                     if "speak" in user_message.lower():
-                        await add_to_tts_queue(message, final_response)
+                        await add_to_tts_queue(message, initial_response)
                 else:
-                    await message.channel.send("Sorry, I couldn't get a response from the character, even after a web search.")
-
-            else:
-                await message.channel.send("Sorry, I couldn't get a response from the character.")
+                    await message.channel.send("Sorry, I couldn't get a response from the character.")
             return
 
 @bot.event
@@ -881,7 +879,9 @@ async def stop(ctx):
         await asyncio.to_thread(kobold_process_manager.stop_koboldcpp)
         if kobold_idle_task and not kobold_idle_task.done():
             kobold_idle_task.cancel()
-        await ctx.send("✅ The KoboldCPP service has been stopped.")
+        chat_histories.clear()
+        logging.info("Chat history has been cleared by manual stop command.")
+        await ctx.send("✅ The KoboldCPP service has been stopped and chat history is cleared.")
     else:
         await ctx.send("The KoboldCPP service is not currently running.")
 
