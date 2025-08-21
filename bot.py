@@ -33,6 +33,7 @@ from config import (
     HIRES_RESIZE_WIDTH, HIRES_RESIZE_HEIGHT,
     MSG_GENERATING, MSG_GEN_ERROR, MSG_NO_PROMPT, MSG_API_ERROR,
     KOBOLDCPP_API_URL, CHARACTER_NAME, CHARACTER_PERSONA, CONTEXT_TOKEN_LIMIT, CHARACTER_GREETING, TIMEZONE_MAP,
+    KOBOLDCPP_PROFILES, LARGE_MODELS,
     KOBOLDCPP_IDLE_TIMEOUT_MINUTES,
     # TTS Settings
     MAX_CONCURRENT_TTS, TTS_TIMEOUT, MSG_TTS_GENERATING, MSG_TTS_ERROR, MSG_TTS_QUEUE_FULL,
@@ -74,6 +75,7 @@ last_forge_use_time = None
 forge_idle_task = None
 last_kobold_use_time = None
 kobold_idle_task = None
+current_kobold_model = None # Tracks the currently running Kobold model name
 
 # --- TTS Queue System ---
 tts_queue = asyncio.Queue()
@@ -357,6 +359,11 @@ class GenerationView(discord.ui.View):
 
 async def _generate_image(ctx, prompt: str, preset_name: str, upscale: bool, seed: int = None):
     """Prepares the payload and calls the Forge API to generate an image."""
+    # Resource Lock: Check if a large model is running
+    if kobold_process_manager.is_koboldcpp_running() and current_kobold_model in LARGE_MODELS:
+        await ctx.send(f"Sorry, the image generator cannot be used while a large language model ('{current_kobold_model}') is running. Please stop the chat AI with `!stop` first.")
+        return
+
     # First, check if the Forge API is online
     if not forge_api.is_online():
         await ctx.send(f"Sorry, the image generation service appears to be offline. Please use the `{COMMAND_PREFIX}start` command to start it.")
@@ -575,10 +582,12 @@ async def kobold_idle_check():
             if KOBOLDCPP_IDLE_TIMEOUT_MINUTES > 0:
                 idle_duration = datetime.datetime.now() - last_kobold_use_time
                 if idle_duration.total_seconds() > KOBOLDCPP_IDLE_TIMEOUT_MINUTES * 60:
+                    global current_kobold_model
                     print(f"KoboldCpp has been idle for over {KOBOLDCPP_IDLE_TIMEOUT_MINUTES} minutes. Shutting down.")
                     if status_channel:
                         await status_channel.send(f"The chat AI has been idle for {KOBOLDCPP_IDLE_TIMEOUT_MINUTES} minutes and is going dormant. Use `!gemma` to wake it up.")
                     kobold_process_manager.stop_koboldcpp()
+                    current_kobold_model = None # Reset current model
                     chat_histories.clear()
                     logging.info("Chat history has been cleared due to inactivity.")
 
@@ -822,26 +831,47 @@ async def viewprofile(ctx):
         logging.error(f"Failed to view profile for user {ctx.author.id}: {e}")
         await ctx.send("Sorry, there was an error retrieving your profile.", ephemeral=True)
 
-@bot.command(name="gemma", help="Starts the KoboldCPP service.")
-async def gemma(ctx):
-    """Starts the KoboldCpp service and the idle timer."""
-    global last_kobold_use_time, kobold_idle_task
+@bot.command(name="gemma", help="Starts the KoboldCPP service with a specific model.")
+async def gemma(ctx, *, model_name: str = "default"):
+    """Starts the KoboldCpp service with a specified model profile."""
+    global last_kobold_use_time, kobold_idle_task, current_kobold_model
+
+    # Sanitize the model name from the argument
+    model_name = model_name.strip().lower()
+    if not model_name: # Handles case where user might just type "!gemma " with spaces
+        model_name = "default"
+
+    # --- Pre-launch Checks ---
     if kobold_process_manager.is_koboldcpp_running():
         if kobold_api.is_online():
-            await ctx.send("The KoboldCPP service is already running.")
+            await ctx.send(f"The KoboldCPP service is already running with the '{current_kobold_model}' model.")
         else:
             await ctx.send("The KoboldCPP service is starting, but not yet online. Please wait a moment.")
         return
 
-    await ctx.send("🚀 Starting the KoboldCPP service... This may take a few minutes.")
-
-    success = await asyncio.to_thread(kobold_process_manager.start_koboldcpp)
-    if not success:
-        await ctx.send("❌ Failed to start the KoboldCPP service. Please check the bot's console for errors.")
+    if model_name not in KOBOLDCPP_PROFILES:
+        await ctx.send(f"❌ Error: Model profile '{model_name}' is not defined in the bot's configuration. Available models: {', '.join(KOBOLDCPP_PROFILES.keys())}")
         return
 
-    # Now, wait for the API to become online
-    await ctx.send("...KoboldCPP process started. Waiting for the API to become responsive...")
+    # --- Resource Conflict Logic ---
+    if model_name in LARGE_MODELS and process_manager.is_forge_running():
+        await ctx.send(
+            "The image generator is currently active, so I cannot start the large chat model. "
+            "You can either stop the image generator by typing `!paint stop` and then try again, "
+            "or you can start the default chat model now by typing `!gemma`."
+        )
+        return
+
+    # --- Start the Service ---
+    await ctx.send(f"🚀 Starting the KoboldCPP service with the '{model_name}' model... This may take a few minutes.")
+
+    success, started_model = await asyncio.to_thread(kobold_process_manager.start_koboldcpp, model_name)
+    if not success:
+        await ctx.send(f"❌ Failed to start the KoboldCPP service with model '{model_name}'. Please check the bot's console for errors.")
+        return
+
+    # --- Wait for API to be Online ---
+    await ctx.send(f"...KoboldCPP process started. Waiting for the API to become responsive...")
 
     online = False
     for i in range(24): # Wait up to 2 minutes
@@ -852,11 +882,11 @@ async def gemma(ctx):
 
     if online:
         last_kobold_use_time = datetime.datetime.now()
-        # Start the idle check task if it's not already running
+        current_kobold_model = started_model # Set the currently running model
         if kobold_idle_task is None or kobold_idle_task.done():
             kobold_idle_task = bot.loop.create_task(kobold_idle_check())
             logging.info("KoboldCpp idle check task started.")
-        await ctx.send(f"✅ The KoboldCPP service is now online and ready to use! It will go dormant after {KOBOLDCPP_IDLE_TIMEOUT_MINUTES} minutes of inactivity.")
+        await ctx.send(f"✅ The '{current_kobold_model}' model is now online and ready to chat! It will go dormant after {KOBOLDCPP_IDLE_TIMEOUT_MINUTES} minutes of inactivity.")
     else:
         await ctx.send("⚠️ The KoboldCPP service started but did not become responsive in time. It might be stuck or still loading.")
 
@@ -873,13 +903,14 @@ async def listen(ctx):
 @bot.command(name="stop", help="Manually stops the KoboldCpp service.")
 async def stop(ctx):
     """Manually stops the KoboldCpp service and the idle timer."""
-    global kobold_idle_task
+    global kobold_idle_task, current_kobold_model
     if kobold_process_manager.is_koboldcpp_running():
         await ctx.send("🛑 Stopping the KoboldCPP service...")
         await asyncio.to_thread(kobold_process_manager.stop_koboldcpp)
         if kobold_idle_task and not kobold_idle_task.done():
             kobold_idle_task.cancel()
         chat_histories.clear()
+        current_kobold_model = None # Reset current model
         logging.info("Chat history has been cleared by manual stop command.")
         await ctx.send("✅ The KoboldCPP service has been stopped and chat history is cleared.")
     else:
@@ -903,6 +934,11 @@ async def deleteprofile(ctx):
 # --- Service Management Commands ---
 @paint.command(name="start", help="Starts the Forge backend service.")
 async def start_service(ctx):
+    # Resource Lock: Check if a large model is running
+    if kobold_process_manager.is_koboldcpp_running() and current_kobold_model in LARGE_MODELS:
+        await ctx.send(f"Sorry, the Forge service cannot be started while a large language model ('{current_kobold_model}') is running. Please stop the chat AI with `!stop` first.")
+        return
+
     if process_manager.is_forge_running():
         await ctx.send("The Forge service is already running.")
         return

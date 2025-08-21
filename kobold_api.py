@@ -3,12 +3,22 @@
 import requests
 import json
 
-from config import KOBOLDCPP_API_URL, KOBOLDCPP_CHAT_ENDPOINT
+from config import KOBOLDCPP_API_URL, KOBOLDCPP_CHAT_ENDPOINT, KOBOLDCPP_MAX_LENGTH
 
 class KoboldAPIClient:
     def __init__(self, base_url=KOBOLDCPP_API_URL):
         self.base_url = base_url
         self.chat_url = f"{self.base_url}{KOBOLDCPP_CHAT_ENDPOINT}"
+
+    def is_online(self):
+        """Checks if the Kobold API is responsive."""
+        try:
+            response = requests.get(self.base_url, timeout=5)
+            return response.status_code == 200
+        except requests.ConnectionError:
+            return False
+        except requests.RequestException:
+            return False
 
     def _send_request(self, method, url, data=None):
         """Helper to send HTTP requests and handle common errors."""
@@ -44,7 +54,7 @@ class KoboldAPIClient:
         """
         payload = {
             "prompt": prompt,
-            "max_length": 450,
+            "max_length": KOBOLDCPP_MAX_LENGTH,
             "temperature": 1.0,
             "top_p": 0.95,
             "top_k": 64,

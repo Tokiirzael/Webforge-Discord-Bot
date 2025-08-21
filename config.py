@@ -83,8 +83,30 @@ FORGE_IDLE_TIMEOUT_MINUTES = 30
 KOBOLDCPP_API_URL = "http://127.0.0.1:5001" # The base URL for your KoboldCpp instance
 KOBOLDCPP_CHAT_ENDPOINT = "/api/v1/generate" # The endpoint for text generation
 KOBOLDCPP_LAUNCH_SCRIPT_PATH = "" # The path to your koboldcpp.exe
-KOBOLDCPP_PROFILE_PATH = "" # The path to your .kcpps profile file
+
+# --- KoboldCpp Model Profiles ---
+# Define the chat models the bot can load.
+# Each key is a "model name" you can use with the !gemma command (e.g., !gemma 12b).
+# The "default" model is used when you run !gemma without a name.
+# "profile_path" should be the full path to the .kcpps file for that model.
+KOBOLDCPP_PROFILES = {
+    "default": {
+        "profile_path": "" # IMPORTANT: SET THIS to the path of your default model's .kcpps file
+    },
+    "12b": {
+        "profile_path": "" # IMPORTANT: SET THIS to the path of your Gemma 12B model's .kcpps file
+    }
+}
+
+# A list of model names that are considered "large". These models will have
+# resource restrictions (e.g., cannot run at the same time as the image generator).
+LARGE_MODELS = ["12b"]
+
 KOBOLDCPP_IDLE_TIMEOUT_MINUTES = 30 # How many minutes of inactivity before shutting down KoboldCpp. Set to 0 to disable.
+
+# The maximum number of new tokens the AI can generate in a single response.
+# Higher values allow for longer responses, but may take more time.
+KOBOLDCPP_MAX_LENGTH = 450
 
 # --- Web Search API Settings ---
 # The name of the environment variable for your SerpApi API key.
