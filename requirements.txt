@@ -1,0 +1,6 @@
+discord.py
+python-dotenv
+requests
+Pillow
+google-search-results
+beautifulsoup4
